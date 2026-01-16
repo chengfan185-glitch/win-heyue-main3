@@ -841,6 +841,60 @@ def run_once_for_symbol(
         return
 
     # --------------------------------------------------
+    # 9.5. TP/SL fallback - ensure stop_loss_price and take_profit_price are not None
+    # --------------------------------------------------
+    try:
+        sl = adjusted_params.get("stop_loss_price") if adjusted_params else None
+        tp = adjusted_params.get("take_profit_price") if adjusted_params else None
+        
+        if sl is None or tp is None:
+            # Get stop loss and take profit percentages
+            sl_pct = adjusted_params.get("stop_loss_pct") if adjusted_params else None
+            tp_pct = adjusted_params.get("take_profit_pct") if adjusted_params else None
+            
+            # Fall back to environment variables if not in adjusted_params
+            if sl_pct is None:
+                sl_pct = os.getenv("STOP_LOSS_PCT")
+            if tp_pct is None:
+                tp_pct = os.getenv("TAKE_PROFIT_PCT")
+            
+            # Convert to float with defaults
+            try:
+                sl_pct = float(sl_pct) if sl_pct is not None else 0.01
+            except Exception:
+                sl_pct = 0.01
+            try:
+                tp_pct = float(tp_pct) if tp_pct is not None else 0.01
+            except Exception:
+                tp_pct = 0.01
+            
+            # Calculate based on direction
+            if action.upper() == "LONG":
+                sl_calc = entry_price_local * (1 - sl_pct)
+                tp_calc = entry_price_local * (1 + tp_pct)
+            else:  # SHORT
+                sl_calc = entry_price_local * (1 + sl_pct)
+                tp_calc = entry_price_local * (1 - tp_pct)
+            
+            # Update adjusted_params with calculated values
+            if adjusted_params is None:
+                adjusted_params = {}
+            if sl is None:
+                adjusted_params["stop_loss_price"] = sl_calc
+            if tp is None:
+                adjusted_params["take_profit_price"] = tp_calc
+            
+            print(
+                f"[TP/SL Fallback] symbol={symbol} side={action} entry_price={entry_price_local} "
+                f"sl={adjusted_params.get('stop_loss_price')} tp={adjusted_params.get('take_profit_price')} "
+                f"(sl_pct={sl_pct} tp_pct={tp_pct})"
+            )
+    except Exception as e:
+        print(f"[TP/SL Fallback ERROR] {symbol}: {e}")
+        import traceback
+        traceback.print_exc()
+
+    # --------------------------------------------------
     # 10. Execute order (with EdgeGate v2 position sizing)
     # --------------------------------------------------
     if TRADING_MODE == "paper":

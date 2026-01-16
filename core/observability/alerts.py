@@ -102,3 +102,131 @@ class AlertManager:
 
     def critical(self, msg: str) -> bool:
         return self.send(AlertLevel.CRITICAL, msg)
+
+    # ------------ 兼容 futures_runner_v2.py 的 send_alert 接口 ------------
+    def send_alert(
+        self,
+        level,
+        title: str,
+        message: str,
+        extra: Optional[dict] = None,
+    ) -> None:
+        """
+        兼容 futures_runner_v2.py 调用：
+          alerts.send_alert(AlertLevel.ERROR, "System Error", "XXX", extra_info)
+
+        - level: 可以是 AlertLevel 枚举，或者字符串
+        - title, message: 文本
+        - extra: 可选字典，会被忽略（不抛异常）
+        
+        此方法不抛异常，确保告警失败不会中断主流程
+        """
+        try:
+            # Handle level - could be AlertLevel enum or string
+            if isinstance(level, AlertLevel):
+                level_val = level
+            elif isinstance(level, str):
+                level_name = level.upper()
+                try:
+                    level_val = AlertLevel[level_name]
+                except KeyError:
+                    level_val = AlertLevel.INFO
+            elif hasattr(level, "name"):
+                # Handle enum-like objects with .name attribute
+                level_name = str(level.name).upper()
+                try:
+                    level_val = AlertLevel[level_name]
+                except KeyError:
+                    level_val = AlertLevel.INFO
+            else:
+                level_val = AlertLevel.INFO
+
+            # Combine title and message
+            prefix = f"[{level_val.name}] {title}".strip()
+            text = prefix
+            if message:
+                text = f"{prefix}\n\n{message}"
+
+            # Send the alert
+            self.send(level_val, text)
+        except Exception as e:
+            # Never raise exceptions to calling code
+            logger.exception("[AlertManager] unexpected error in send_alert: %s", e)
+
+    # ------------ 语义封装方法（供 runner 调用）------------
+    def alert_system_startup(self, trading_mode: str, run_id: str) -> None:
+        """交易系统启动通知"""
+        try:
+            msg = (
+                "[INFO] 交易系统已启动\n\n"
+                f"运行模式：{trading_mode}\n"
+                f"运行ID：{run_id}"
+            )
+            self.info(msg)
+        except Exception as e:
+            logger.exception("[AlertManager] error in alert_system_startup: %s", e)
+
+    def alert_quota_exhausted(self, symbol: str, remaining: int) -> None:
+        """某个品种当日 quota 用完"""
+        try:
+            msg = (
+                "[WARNING] Quota Exhausted\n\n"
+                f"Daily quota exhausted for {symbol}\n"
+                f"Remaining quota (report)：{remaining}"
+            )
+            self.warning(msg)
+        except Exception as e:
+            logger.exception("[AlertManager] error in alert_quota_exhausted: %s", e)
+
+    def alert_order_placed(
+        self,
+        symbol: str,
+        side: str,
+        size_usd: float,
+        entry_price: float,
+        trading_mode: str,
+    ) -> None:
+        """下单成功通知"""
+        try:
+            msg = (
+                "[ORDER] 新订单已提交\n\n"
+                f"模式：{trading_mode}\n"
+                f"品种：{symbol}\n"
+                f"方向：{side}\n"
+                f"名义金额：{size_usd:.2f} USDT\n"
+                f"入场价：{entry_price}"
+            )
+            self.info(msg)
+        except Exception as e:
+            logger.exception("[AlertManager] error in alert_order_placed: %s", e)
+
+    def alert_fatal_error(self, message: str) -> None:
+        """致命错误通知"""
+        try:
+            self.error(f"[FATAL] {message}")
+        except Exception as e:
+            logger.exception("[AlertManager] error in alert_fatal_error: %s", e)
+
+    def alert_order_failed(self, symbol: str, error_msg: str) -> None:
+        """订单失败通知"""
+        try:
+            msg = f"[ORDER FAILED] {symbol}\n\nError: {error_msg}"
+            self.error(msg)
+        except Exception as e:
+            logger.exception("[AlertManager] error in alert_order_failed: %s", e)
+
+    def alert_reconciliation_failed(self, report: str) -> None:
+        """对账失败通知"""
+        try:
+            msg = f"[RECONCILIATION] Failed\n\n{report}"
+            self.warning(msg)
+        except Exception as e:
+            logger.exception("[AlertManager] error in alert_reconciliation_failed: %s", e)
+
+    def alert_system_shutdown(self, reason: str) -> None:
+        """系统关闭通知"""
+        try:
+            msg = f"[SHUTDOWN] System shutting down\n\nReason: {reason}"
+            self.warning(msg)
+        except Exception as e:
+            logger.exception("[AlertManager] error in alert_system_shutdown: %s", e)
