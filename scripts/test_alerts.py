@@ -28,7 +28,9 @@ a1.send_alert('INFO', 'test', 'this is a test (disabled)')
 # enabled flag true but no token => send should be disabled internally
 # this checks no exception is raised when send_alert is called
 try:
-    a2 = AlertManager(enabled=True, bot_token=os.environ.get('TELEGRAM_BOT_TOKEN'), chat_id=os.environ.get('TELEGRAM_CHAT_ID'))
+    bot_token = os.environ.get('TELEGRAM_BOT_TOKEN')
+    chat_id = os.environ.get('TELEGRAM_CHAT_ID')
+    a2 = AlertManager(enabled=True, bot_token=bot_token, chat_id=chat_id)
     print("enabled-instance has_send_alert:", hasattr(a2, 'send_alert'))
     a2.send_alert('INFO', 'test', 'this is a test (maybe disabled)')
     print('send_alert called successfully')

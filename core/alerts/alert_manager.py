@@ -1,8 +1,9 @@
 from dataclasses import dataclass
 from typing import Optional, Dict, Any
-import logging
-import requests
 import json
+import logging
+
+import requests
 
 logger = logging.getLogger(__name__)
 
@@ -39,8 +40,16 @@ class AlertManager:
         level: str = "INFO",
     ) -> None:
         level = (level or "INFO").upper()
+        actually_enabled = bool(enabled and bot_token and chat_id)
+        
+        if enabled and not actually_enabled:
+            logger.warning(
+                "[AlertManager] enabled=True but missing bot_token or chat_id, "
+                "alerts will be disabled"
+            )
+        
         self.config = AlertConfig(
-            enabled=bool(enabled and bot_token and chat_id),
+            enabled=actually_enabled,
             bot_token=bot_token,
             chat_id=chat_id,
             level=level,
@@ -105,7 +114,7 @@ class AlertManager:
         extra: Optional[Dict[str, Any]] = None,
     ) -> None:
         try:
-            level_name = getattr(level, "name", None) or str(level)
+            level_name = getattr(level, "name", str(level))
             level_name = (level_name or "INFO").upper()
             prefix = f"[{level_name}] {title}".strip()
             text = prefix

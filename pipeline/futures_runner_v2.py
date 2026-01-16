@@ -20,11 +20,14 @@ import sys
 import time
 import json
 import random
+import logging
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import List, Optional, Dict, Any, Literal, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
+
+logger = logging.getLogger(__name__)
 
 def ensure_alert_manager_compat(alerts) -> None:
     """
@@ -252,6 +255,10 @@ BATCH_SHUFFLE_SYMBOLS = os.getenv("BATCH_SHUFFLE_SYMBOLS", "true").lower() == "t
 BATCH_SLEEP_CHOICES = os.getenv("BATCH_SLEEP_CHOICES", "5,8,10,12,15").strip()
 # >>> 新增：启动冷静期（分钟） <<<
 STARTUP_WARMUP_MINUTES = int(os.getenv("STARTUP_WARMUP_MINUTES", "0"))
+
+# TP/SL fallback percentages
+STOP_LOSS_PCT_ENV = float(os.getenv("STOP_LOSS_PCT", "0.01"))
+TAKE_PROFIT_PCT_ENV = float(os.getenv("TAKE_PROFIT_PCT", "0.01"))
 
 
 def _parse_sleep_choices(raw: str) -> List[int]:
@@ -846,8 +853,8 @@ def run_once_for_symbol(
     try:
         sl = adjusted_params.get("stop_loss_price")
         tp = adjusted_params.get("take_profit_price")
-        sl_pct = adjusted_params.get("stop_loss_pct", globals().get("STOP_LOSS_PCT_ENV", None))
-        tp_pct = adjusted_params.get("take_profit_pct", globals().get("TAKE_PROFIT_PCT_ENV", None))
+        sl_pct = adjusted_params.get("stop_loss_pct", STOP_LOSS_PCT_ENV)
+        tp_pct = adjusted_params.get("take_profit_pct", TAKE_PROFIT_PCT_ENV)
 
         entry_price = None
         try:
@@ -879,15 +886,13 @@ def run_once_for_symbol(
             if tp is None:
                 adjusted_params["take_profit_price"] = tp_calc
 
-            import logging
-            logging.getLogger(__name__).debug(
+            logger.debug(
                 "[TP/SL Fallback] symbol=%s side=%s entry_price=%s sl=%s tp=%s (sl_pct=%s tp_pct=%s)",
                 symbol, side, entry_price, adjusted_params.get("stop_loss_price"),
                 adjusted_params.get("take_profit_price"), sl_pct, tp_pct,
             )
     except Exception:
-        import logging
-        logging.getLogger(__name__).exception("TP/SL fallback failed")
+        logger.exception("TP/SL fallback failed")
 
     # --------------------------------------------------
     # 10. Execute order (with EdgeGate v2 position sizing)
@@ -1141,7 +1146,7 @@ def main():
 
     def _compat_send_alert(self, level, title, message, extra=None):
         try:
-            level_name = getattr(level, "name", None) or str(level)
+            level_name = getattr(level, "name", str(level))
             level_name = (level_name or "INFO").upper()
             prefix = f"[{level_name}] {title}".strip()
             text = prefix
@@ -1167,11 +1172,9 @@ def main():
                 except Exception:
                     pass
 
-            import logging
-            logging.getLogger(__name__).info(text)
+            logger.info(text)
         except Exception:
-            import logging
-            logging.getLogger(__name__).exception("Alert compatibility shim failed")
+            logger.exception("Alert compatibility shim failed")
 
     if not hasattr(alerts, "send_alert"):
         alerts.send_alert = MethodType(_compat_send_alert, alerts)
