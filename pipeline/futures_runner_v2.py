@@ -861,11 +861,11 @@ def run_once_for_symbol(
             # Convert to float with defaults
             try:
                 sl_pct = float(sl_pct) if sl_pct is not None else 0.01
-            except Exception:
+            except (ValueError, TypeError):
                 sl_pct = 0.01
             try:
                 tp_pct = float(tp_pct) if tp_pct is not None else 0.01
-            except Exception:
+            except (ValueError, TypeError):
                 tp_pct = 0.01
             
             # Calculate based on direction

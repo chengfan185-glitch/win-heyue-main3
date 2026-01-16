@@ -104,6 +104,7 @@ class AlertManager:
         return self.send(AlertLevel.CRITICAL, msg)
 
     # ------------ 兼容 futures_runner_v2.py 的 send_alert 接口 ------------
+    # ------------ Compatibility interface for futures_runner_v2.py ------------
     def send_alert(
         self,
         level,
@@ -115,11 +116,18 @@ class AlertManager:
         兼容 futures_runner_v2.py 调用：
           alerts.send_alert(AlertLevel.ERROR, "System Error", "XXX", extra_info)
 
+        Compatible with futures_runner_v2.py calls:
+          alerts.send_alert(AlertLevel.ERROR, "System Error", "XXX", extra_info)
+
         - level: 可以是 AlertLevel 枚举，或者字符串
+        - level: Can be AlertLevel enum or string
         - title, message: 文本
+        - title, message: Text content
         - extra: 可选字典，会被忽略（不抛异常）
+        - extra: Optional dict, will be ignored (no exceptions)
         
         此方法不抛异常，确保告警失败不会中断主流程
+        This method never raises exceptions, ensuring alert failures don't interrupt main flow
         """
         try:
             # Handle level - could be AlertLevel enum or string
@@ -154,8 +162,9 @@ class AlertManager:
             logger.exception("[AlertManager] unexpected error in send_alert: %s", e)
 
     # ------------ 语义封装方法（供 runner 调用）------------
+    # ------------ Semantic wrapper methods (for runner calls) ------------
     def alert_system_startup(self, trading_mode: str, run_id: str) -> None:
-        """交易系统启动通知"""
+        """交易系统启动通知 / System startup notification"""
         try:
             msg = (
                 "[INFO] 交易系统已启动\n\n"
@@ -167,7 +176,7 @@ class AlertManager:
             logger.exception("[AlertManager] error in alert_system_startup: %s", e)
 
     def alert_quota_exhausted(self, symbol: str, remaining: int) -> None:
-        """某个品种当日 quota 用完"""
+        """某个品种当日 quota 用完 / Daily quota exhausted for a symbol"""
         try:
             msg = (
                 "[WARNING] Quota Exhausted\n\n"
@@ -186,7 +195,7 @@ class AlertManager:
         entry_price: float,
         trading_mode: str,
     ) -> None:
-        """下单成功通知"""
+        """下单成功通知 / Order placed successfully"""
         try:
             msg = (
                 "[ORDER] 新订单已提交\n\n"
@@ -201,14 +210,14 @@ class AlertManager:
             logger.exception("[AlertManager] error in alert_order_placed: %s", e)
 
     def alert_fatal_error(self, message: str) -> None:
-        """致命错误通知"""
+        """致命错误通知 / Fatal error notification"""
         try:
             self.error(f"[FATAL] {message}")
         except Exception as e:
             logger.exception("[AlertManager] error in alert_fatal_error: %s", e)
 
     def alert_order_failed(self, symbol: str, error_msg: str) -> None:
-        """订单失败通知"""
+        """订单失败通知 / Order failure notification"""
         try:
             msg = f"[ORDER FAILED] {symbol}\n\nError: {error_msg}"
             self.error(msg)
@@ -216,7 +225,7 @@ class AlertManager:
             logger.exception("[AlertManager] error in alert_order_failed: %s", e)
 
     def alert_reconciliation_failed(self, report: str) -> None:
-        """对账失败通知"""
+        """对账失败通知 / Reconciliation failure notification"""
         try:
             msg = f"[RECONCILIATION] Failed\n\n{report}"
             self.warning(msg)
@@ -224,7 +233,7 @@ class AlertManager:
             logger.exception("[AlertManager] error in alert_reconciliation_failed: %s", e)
 
     def alert_system_shutdown(self, reason: str) -> None:
-        """系统关闭通知"""
+        """系统关闭通知 / System shutdown notification"""
         try:
             msg = f"[SHUTDOWN] System shutting down\n\nReason: {reason}"
             self.warning(msg)
