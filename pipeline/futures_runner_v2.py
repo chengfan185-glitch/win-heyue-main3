@@ -877,7 +877,14 @@ def run_once_for_symbol(
             if side and side.upper() == "LONG":
                 sl_calc = entry_price * (1 - sl_pct)
                 tp_calc = entry_price * (1 + tp_pct)
+            elif side and side.upper() == "SHORT":
+                sl_calc = entry_price * (1 + sl_pct)
+                tp_calc = entry_price * (1 - tp_pct)
             else:
+                logger.warning(
+                    "[TP/SL Fallback] Unexpected side value: %s for %s, defaulting to SHORT logic",
+                    side, symbol
+                )
                 sl_calc = entry_price * (1 + sl_pct)
                 tp_calc = entry_price * (1 - tp_pct)
 

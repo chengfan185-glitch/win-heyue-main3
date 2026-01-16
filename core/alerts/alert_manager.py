@@ -1,7 +1,7 @@
 from dataclasses import dataclass
-from typing import Optional, Dict, Any
 import json
 import logging
+from typing import Optional, Dict, Any
 
 import requests
 
