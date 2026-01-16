@@ -20,6 +20,8 @@ import sys
 import time
 import json
 import random
+import logging
+import traceback
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import List, Optional, Dict, Any, Literal, Tuple
@@ -869,7 +871,8 @@ def run_once_for_symbol(
                 tp_pct = 0.01
             
             # Calculate based on direction
-            if action.upper() == "LONG":
+            action_upper = action.upper()
+            if action_upper == "LONG":
                 sl_calc = entry_price_local * (1 - sl_pct)
                 tp_calc = entry_price_local * (1 + tp_pct)
             else:  # SHORT
@@ -891,8 +894,7 @@ def run_once_for_symbol(
             )
     except Exception as e:
         print(f"[TP/SL Fallback ERROR] {symbol}: {e}")
-        import traceback
-        traceback.print_exc()
+        logging.getLogger(__name__).exception("TP/SL fallback failed")
 
     # --------------------------------------------------
     # 10. Execute order (with EdgeGate v2 position sizing)
