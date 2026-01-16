@@ -165,7 +165,7 @@ from core.ledger.trade_ledger import TradeLedger, Order, Position, Trade, BOT_PR
 from core.ledger.reconciliation import StateReconciliation, ReconciliationMode
 from core.execution.order_executor import OrderExecutor
 from core.observability.metrics import MetricsCollector
-from core.observability.alerts import AlertManager, AlertLevel
+from core.alerts.alert_manager import AlertManager, AlertLevel
 from core.utils.time import now_shanghai, format_dt_shanghai, shanghai_local_date
 from risk.edge_gate import edge_cost_gate
 from risk.edge_gate_v2 import EdgeGateV2, create_default_edge_gate_v2
@@ -856,6 +856,30 @@ def run_once_for_symbol(
         stop_loss = adjusted_params.get("stop_loss_price") if adjusted_params else None
         take_profit = adjusted_params.get("take_profit_price") if adjusted_params else None
 
+        # ========== TP/SL Fallback Logic ==========
+        # If adjusted_params lacks TP/SL, compute from entry_price and percentages
+        if stop_loss is None or take_profit is None:
+            print(f"[TP/SL Fallback] Detected missing TP/SL for {symbol}, computing from entry_price and percentages")
+            
+            # Get percentages from environment or use defaults
+            stop_loss_pct = float(os.getenv("STOP_LOSS_PCT", "0.01"))  # Default 1%
+            take_profit_pct = float(os.getenv("TAKE_PROFIT_PCT", "0.01"))  # Default 1%
+            
+            if stop_loss is None:
+                if action == "LONG":
+                    stop_loss = entry_price_local * (1 - stop_loss_pct)
+                else:  # SHORT
+                    stop_loss = entry_price_local * (1 + stop_loss_pct)
+                print(f"[TP/SL Fallback] Computed stop_loss={stop_loss:.6f} from entry={entry_price_local} pct={stop_loss_pct}")
+            
+            if take_profit is None:
+                if action == "LONG":
+                    take_profit = entry_price_local * (1 + take_profit_pct)
+                else:  # SHORT
+                    take_profit = entry_price_local * (1 - take_profit_pct)
+                print(f"[TP/SL Fallback] Computed take_profit={take_profit:.6f} from entry={entry_price_local} pct={take_profit_pct}")
+        # ========== End TP/SL Fallback ==========
+
         print(
             f"[DEBUG adjusted_params RAW] symbol={symbol} side={action} entry={entry_price_local} "
             f"STOP_LOSS_PCT_ENV={os.getenv('STOP_LOSS_PCT')} TAKE_PROFIT_PCT_ENV={os.getenv('TAKE_PROFIT_PCT')} "
@@ -961,6 +985,30 @@ def run_once_for_symbol(
 
             stop_loss = adjusted_params.get("stop_loss_price") if adjusted_params else None
             take_profit = adjusted_params.get("take_profit_price") if adjusted_params else None
+
+            # ========== TP/SL Fallback Logic ==========
+            # If adjusted_params lacks TP/SL, compute from entry_price and percentages
+            if stop_loss is None or take_profit is None:
+                print(f"[TP/SL Fallback] Detected missing TP/SL for {symbol}, computing from real_price and percentages")
+                
+                # Get percentages from environment or use defaults
+                stop_loss_pct = float(os.getenv("STOP_LOSS_PCT", "0.01"))  # Default 1%
+                take_profit_pct = float(os.getenv("TAKE_PROFIT_PCT", "0.01"))  # Default 1%
+                
+                if stop_loss is None:
+                    if action == "LONG":
+                        stop_loss = real_price * (1 - stop_loss_pct)
+                    else:  # SHORT
+                        stop_loss = real_price * (1 + stop_loss_pct)
+                    print(f"[TP/SL Fallback] Computed stop_loss={stop_loss:.6f} from entry={real_price} pct={stop_loss_pct}")
+                
+                if take_profit is None:
+                    if action == "LONG":
+                        take_profit = real_price * (1 + take_profit_pct)
+                    else:  # SHORT
+                        take_profit = real_price * (1 - take_profit_pct)
+                    print(f"[TP/SL Fallback] Computed take_profit={take_profit:.6f} from entry={real_price} pct={take_profit_pct}")
+            # ========== End TP/SL Fallback ==========
 
             side = "BUY" if action == "LONG" else "SELL"
 
@@ -1088,6 +1136,7 @@ def main():
     alerts = AlertManager()
     
     print("✅ Alert manager initialized")
+    print(f"[DEBUG] AlertManager type: {type(alerts)}, has send_alert: {hasattr(alerts, 'send_alert')}")
     # === 兼容层：确保实例上一定有 send_alert 方法 ===
     try:
         from types import MethodType
