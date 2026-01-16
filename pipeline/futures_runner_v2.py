@@ -841,6 +841,55 @@ def run_once_for_symbol(
         return
 
     # --------------------------------------------------
+    # 9.5. TP/SL Fallback - Ensure stop_loss_price and take_profit_price are set
+    # --------------------------------------------------
+    try:
+        sl = adjusted_params.get("stop_loss_price")
+        tp = adjusted_params.get("take_profit_price")
+        sl_pct = adjusted_params.get("stop_loss_pct", globals().get("STOP_LOSS_PCT_ENV", None))
+        tp_pct = adjusted_params.get("take_profit_pct", globals().get("TAKE_PROFIT_PCT_ENV", None))
+
+        entry_price = None
+        try:
+            entry_price = float(real_price) if real_price is not None else None
+        except Exception:
+            entry_price = None
+
+        side = action
+
+        if entry_price is not None and (sl is None or tp is None):
+            try:
+                sl_pct = float(sl_pct) if sl_pct is not None else 0.01
+            except Exception:
+                sl_pct = 0.01
+            try:
+                tp_pct = float(tp_pct) if tp_pct is not None else 0.01
+            except Exception:
+                tp_pct = 0.01
+
+            if side and side.upper() == "LONG":
+                sl_calc = entry_price * (1 - sl_pct)
+                tp_calc = entry_price * (1 + tp_pct)
+            else:
+                sl_calc = entry_price * (1 + sl_pct)
+                tp_calc = entry_price * (1 - tp_pct)
+
+            if sl is None:
+                adjusted_params["stop_loss_price"] = sl_calc
+            if tp is None:
+                adjusted_params["take_profit_price"] = tp_calc
+
+            import logging
+            logging.getLogger(__name__).debug(
+                "[TP/SL Fallback] symbol=%s side=%s entry_price=%s sl=%s tp=%s (sl_pct=%s tp_pct=%s)",
+                symbol, side, entry_price, adjusted_params.get("stop_loss_price"),
+                adjusted_params.get("take_profit_price"), sl_pct, tp_pct,
+            )
+    except Exception:
+        import logging
+        logging.getLogger(__name__).exception("TP/SL fallback failed")
+
+    # --------------------------------------------------
     # 10. Execute order (with EdgeGate v2 position sizing)
     # --------------------------------------------------
     if TRADING_MODE == "paper":
@@ -1088,35 +1137,49 @@ def main():
     alerts = AlertManager()
     
     print("✅ Alert manager initialized")
-    # === 兼容层：确保实例上一定有 send_alert 方法 ===
-    try:
-        from types import MethodType
-    except ImportError:
-        MethodType = None  # 理论上不会发生
+    from types import MethodType
 
-    if not hasattr(alerts, "send_alert") and MethodType is not None:
-        def _send_alert(self, level, title, message, extra=None):
-            """
-            兼容旧接口：
-            - level 可能是 AlertLevel 枚举，也可能是字符串
-            - title / message 组合成一条纯文本
-            """
-            level_name = getattr(level, "name", str(level)).upper()
+    def _compat_send_alert(self, level, title, message, extra=None):
+        try:
+            level_name = getattr(level, "name", None) or str(level)
+            level_name = (level_name or "INFO").upper()
             prefix = f"[{level_name}] {title}".strip()
             text = prefix
             if message:
                 text = f"{prefix}\n\n{message}"
 
-            # 简单映射到 info / warning / error
-            if "ERROR" in level_name or "FATAL" in level_name:
-                self.error(text)
-            elif "WARN" in level_name:
-                self.warning(text)
-            else:
-                self.info(text)
+            if hasattr(self, "error") and ("ERROR" in level_name or "FATAL" in level_name):
+                try:
+                    self.error(text)
+                    return
+                except Exception:
+                    pass
+            if hasattr(self, "warning") and "WARN" in level_name:
+                try:
+                    self.warning(text)
+                    return
+                except Exception:
+                    pass
+            if hasattr(self, "info"):
+                try:
+                    self.info(text)
+                    return
+                except Exception:
+                    pass
 
-        alerts.send_alert = MethodType(_send_alert, alerts)
+            import logging
+            logging.getLogger(__name__).info(text)
+        except Exception:
+            import logging
+            logging.getLogger(__name__).exception("Alert compatibility shim failed")
+
+    if not hasattr(alerts, "send_alert"):
+        alerts.send_alert = MethodType(_compat_send_alert, alerts)
         print("✅ AlertManager compatibility shim (send_alert) attached")
+
+    # Diagnostic print to help debugging instances
+    print("alerts instance:", type(alerts), "module:", type(alerts).__module__, "has_send_alert=", hasattr(alerts, 'send_alert'))
+
     if FUTURES_MARKET_TYPE == "UM":
         adapter = BinanceUMFuturesAdapter(trading_mode=TRADING_MODE)
     else:

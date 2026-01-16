@@ -102,3 +102,96 @@ class AlertManager:
 
     def critical(self, msg: str) -> bool:
         return self.send(AlertLevel.CRITICAL, msg)
+
+    # Semantic helper methods for runner compatibility
+    def alert_system_startup(self, trading_mode: str, run_id: str) -> bool:
+        """System startup notification"""
+        msg = (
+            "交易系统已启动\n"
+            f"运行模式：{trading_mode}\n"
+            f"运行ID：{run_id}"
+        )
+        return self.info(msg)
+
+    def alert_quota_exhausted(self, symbol: str, remaining: int) -> bool:
+        """Daily quota exhausted notification"""
+        msg = (
+            f"Daily quota exhausted for {symbol}\n"
+            f"Remaining quota：{remaining}"
+        )
+        return self.warning(msg)
+
+    def alert_order_placed(
+        self,
+        symbol: str,
+        side: str,
+        size_usd: float,
+        entry_price: float,
+        trading_mode: str,
+    ) -> bool:
+        """Order placement notification"""
+        msg = (
+            "新订单已提交\n"
+            f"模式：{trading_mode}\n"
+            f"品种：{symbol}\n"
+            f"方向：{side}\n"
+            f"名义金额：{size_usd:.2f} USDT\n"
+            f"入场价：{entry_price}"
+        )
+        return self.info(msg)
+
+    def alert_fatal_error(self, message: str) -> bool:
+        """Fatal error notification"""
+        return self.critical(f"[FATAL] {message}")
+
+    def alert_order_failed(self, symbol: str, error_msg: str) -> bool:
+        """Order failure notification"""
+        msg = f"订单失败 - {symbol}\n错误：{error_msg}"
+        return self.error(msg)
+
+    def alert_reconciliation_failed(self, report: str) -> bool:
+        """Reconciliation failure notification"""
+        msg = f"对账失败\n{report}"
+        return self.error(msg)
+
+    def alert_system_shutdown(self, reason: str) -> bool:
+        """System shutdown notification"""
+        msg = f"交易系统关闭\n原因：{reason}"
+        return self.warning(msg)
+
+    def send_alert(
+        self,
+        level,
+        title: str,
+        message: str,
+        extra: Optional[dict] = None,
+    ) -> bool:
+        """
+        Unified alert API compatible with runner expectations.
+        Accepts enum or string level.
+        """
+        try:
+            # Convert level to AlertLevel if it's a string or other enum
+            if hasattr(level, "name"):
+                level_name = level.name
+            else:
+                level_name = str(level).upper()
+
+            # Map to our AlertLevel
+            level_map = {
+                "DEBUG": AlertLevel.DEBUG,
+                "INFO": AlertLevel.INFO,
+                "WARNING": AlertLevel.WARNING,
+                "WARN": AlertLevel.WARNING,
+                "ERROR": AlertLevel.ERROR,
+                "CRITICAL": AlertLevel.CRITICAL,
+                "FATAL": AlertLevel.CRITICAL,
+            }
+            alert_level = level_map.get(level_name, AlertLevel.INFO)
+
+            # Format message
+            text = f"{title}\n{message}" if message else title
+            return self.send(alert_level, text, also_console=True)
+        except Exception as e:
+            logger.exception(f"Failed to send alert: {e}")
+            return False

@@ -1,30 +1,17 @@
-# core/alerts/alert_manager.py
-from __future__ import annotations
-
-import json
-import logging
 from dataclasses import dataclass
-from enum import Enum
 from typing import Optional, Dict, Any
-
+import logging
 import requests
+import json
 
 logger = logging.getLogger(__name__)
 
-
-class AlertLevel(str, Enum):
-    DEBUG = "DEBUG"
-    INFO = "INFO"
-    WARNING = "WARNING"
-    ERROR = "ERROR"
-
-
-# 等级顺序，用于过滤
 _LEVEL_ORDER: Dict[str, int] = {
     "DEBUG": 10,
     "INFO": 20,
     "WARNING": 30,
     "ERROR": 40,
+    "FATAL": 50,
 }
 
 
@@ -38,19 +25,17 @@ class AlertConfig:
 
 class AlertManager:
     """
-    Telegram 告警封装
-
-    - 支持等级过滤（DEBUG/INFO/WARNING/ERROR）
-    - 支持基础 send() / info() / warning() / error()
-    - 提供统一 send_alert() 入口，兼容 futures_runner_v2.py 的调用
-    - 提供高层语义接口：alert_system_startup / alert_quota_exhausted / alert_order_placed / alert_fatal_error
+    Lightweight alert manager with:
+    - send/debug/info/warning/error
+    - send_alert(level, title, message, extra)
+    - semantic helpers
     """
 
     def __init__(
         self,
-        enabled: bool,
-        bot_token: Optional[str],
-        chat_id: Optional[str],
+        enabled: bool = True,
+        bot_token: Optional[str] = None,
+        chat_id: Optional[str] = None,
         level: str = "INFO",
     ) -> None:
         level = (level or "INFO").upper()
@@ -62,123 +47,98 @@ class AlertManager:
         )
 
         logger.info(
-            "[AlertManager] enabled=%s level=%s chat_id=%s",
+            "[AlertManager] initialized enabled=%s level=%s chat_id=%s",
             self.config.enabled,
             self.config.level,
             self.config.chat_id,
         )
 
-    # ------------ 内部工具 ------------
-
-    def _should_send(self, level_name: str) -> bool:
+    def _should_send(self, level: str) -> bool:
         if not self.config.enabled:
             return False
-        cur = _LEVEL_ORDER.get(self.config.level.upper(), 20)
-        incoming = _LEVEL_ORDER.get(level_name.upper(), 20)
+        cur = _LEVEL_ORDER.get(self.config.level, 20)
+        incoming = _LEVEL_ORDER.get((level or "INFO").upper(), 20)
         return incoming >= cur
 
     def _post_telegram(self, text: str) -> None:
         if not (self.config.bot_token and self.config.chat_id):
+            logger.debug("[AlertManager] telegram disabled or missing token/chat_id")
             return
 
         url = f"https://api.telegram.org/bot{self.config.bot_token}/sendMessage"
-        payload = {
-            "chat_id": self.config.chat_id,
-            # 纯文本，不使用 parse_mode，避免 400
-            "text": text,
-        }
+        payload = {"chat_id": self.config.chat_id, "text": text}
         try:
             r = requests.post(url, data=payload, timeout=10)
             r.raise_for_status()
         except Exception as e:
             logger.error("[ALERT ERROR] Failed to send Telegram alert: %s", e)
 
-    # ------------ 基础接口 ------------
-
-    def send(self, level: AlertLevel | str, text: str) -> None:
-        """
-        底层发送接口：支持 AlertLevel 或字符串
-        """
-        if isinstance(level, AlertLevel):
-            level_name = level.value
-        else:
-            level_name = str(level).upper()
-
-        if not self._should_send(level_name):
-            return
-
-        self._post_telegram(text)
+    def send(self, level: str, text: str) -> None:
+        try:
+            if not self._should_send(level):
+                return
+            self._post_telegram(text)
+        except Exception as e:
+            logger.exception("[AlertManager] unexpected error in send: %s", e)
 
     def debug(self, text: str) -> None:
-        self.send(AlertLevel.DEBUG, text)
+        logger.debug(text)
+        self.send("DEBUG", text)
 
     def info(self, text: str) -> None:
-        self.send(AlertLevel.INFO, text)
+        logger.info(text)
+        self.send("INFO", text)
 
     def warning(self, text: str) -> None:
-        self.send(AlertLevel.WARNING, text)
+        logger.warning(text)
+        self.send("WARNING", text)
 
     def error(self, text: str) -> None:
-        self.send(AlertLevel.ERROR, text)
-
-    # ------------ 统一告警出口（兼容 runner 调用）------------
+        logger.error(text)
+        self.send("ERROR", text)
 
     def send_alert(
         self,
-        level: AlertLevel | str,
+        level,
         title: str,
         message: str,
         extra: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """
-        统一告警出口，兼容 futures_runner_v2.py 中的 alerts.send_alert(...)
+        try:
+            level_name = getattr(level, "name", None) or str(level)
+            level_name = (level_name or "INFO").upper()
+            prefix = f"[{level_name}] {title}".strip()
+            text = prefix
+            if message:
+                text = f"{prefix}\n\n{message}"
 
-        - level: AlertLevel 枚举或 "INFO"/"WARNING"/"ERROR" 等字符串
-        - title: 简短标题
-        - message: 详细内容
-        - extra: 附加信息（dict），仅用于日志打印
-        """
+            if extra:
+                try:
+                    extra_str = json.dumps(extra, ensure_ascii=False, default=str)
+                    text += f"\n\n(extra={extra_str})"
+                except Exception:
+                    pass
 
-        if isinstance(level, AlertLevel):
-            level_name = level.value
-        else:
-            level_name = str(level).upper()
-        if level_name not in _LEVEL_ORDER:
-            level_name = "INFO"
-
-        prefix = f"[{level_name}] {title}"
-
-        # 控制台兜底打印一份（即使 Telegram 掉线也能看到）
-        print(f"{prefix} - {message}")
-        if extra:
-            try:
-                extra_str = json.dumps(extra, ensure_ascii=False)[:800]
-                print(f"{prefix} extra={extra_str}")
-            except Exception:
-                logger.exception("Failed to dump alert extra payload")
-
-        text = f"{prefix}\n\n{message}"
-        self.send(level_name, text)
-
-    # ------------ 语义封装（供 runner 调用）------------
+            if "ERROR" in level_name or "FATAL" in level_name:
+                self.error(text)
+            elif "WARN" in level_name or "WARNING" in level_name:
+                self.warning(text)
+            elif "DEBUG" in level_name:
+                self.debug(text)
+            else:
+                self.info(text)
+        except Exception as e:
+            logger.exception("[AlertManager] unexpected error in send_alert: %s", e)
 
     def alert_system_startup(self, trading_mode: str, run_id: str) -> None:
-        """
-        交易系统启动通知：
-        - 运行模式（paper/testnet/live）
-        - run_id
-        """
         msg = (
             "[INFO] 交易系统已启动\n\n"
             f"运行模式：{trading_mode}\n"
-            f"运行ID： {run_id}"
+            f"运行ID：{run_id}"
         )
         self.info(msg)
 
     def alert_quota_exhausted(self, symbol: str, remaining: int) -> None:
-        """
-        某个品种当日 quota 用完
-        """
         msg = (
             "[WARNING] Quota Exhausted\n\n"
             f"Daily quota exhausted for {symbol}\n"
@@ -194,9 +154,6 @@ class AlertManager:
         entry_price: float,
         trading_mode: str,
     ) -> None:
-        """
-        下单成功通知（paper / testnet / live 通用）
-        """
         msg = (
             "[ORDER] 新订单已提交\n\n"
             f"模式：{trading_mode}\n"
@@ -208,7 +165,4 @@ class AlertManager:
         self.info(msg)
 
     def alert_fatal_error(self, message: str) -> None:
-        """
-        致命错误通知
-        """
         self.error(f"[FATAL] {message}")
