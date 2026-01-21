@@ -1,0 +1,10 @@
+{
+  "ts": 1730000000,
+  "timeframe": "15m",
+  "hold_minutes": 60,
+  "cost_pct": 0.0015,
+  "symbols": ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
+  "topn": [
+    {"symbol":"BTCUSDT","edge_score":82.4,"expected_move_pct":0.010,"noise_score":0.18,"regime":"TREND","why":["space_ok","noise_ok"] }
+  ]
+}
