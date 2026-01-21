@@ -1,0 +1,261 @@
+from dataclasses import dataclass
+from typing import Optional, Dict, Any
+import logging
+import requests
+import json
+
+logger = logging.getLogger(__name__)
+
+# ===============================
+# 告警等级顺序
+# ===============================
+_LEVEL_ORDER: Dict[str, int] = {
+    "DEBUG": 10,
+    "INFO": 20,
+    "WARNING": 30,
+    "ERROR": 40,
+    "FATAL": 50,
+}
+
+# ===============================
+# 英文 → 中文 翻译表（统一在这里维护）
+# ===============================
+_CN_TRANSLATE_MAP: Dict[str, str] = {
+    # 通用
+    "[INFO]": "【信息】",
+    "[WARNING]": "【警告】",
+    "[ERROR]": "【错误】",
+    "[FATAL]": "【致命错误】",
+
+    # 交易 / 风控
+    "Quota Exhausted": "当日下单额度已用完",
+    "Daily quota exhausted": "今日交易次数已耗尽",
+    "Remaining quota": "剩余下单额度",
+    "PAPER OPEN PROBE": "纸上交易｜试探开仓",
+    "OPEN PROBE": "试探开仓",
+
+    # 策略 / 样本
+    "insufficient_samples_probe_trial": "样本不足，进入试探交易阶段",
+    "samples < 50": "样本数量不足 50",
+    "samples": "样本",
+
+    # 方向
+    "LONG": "做多",
+    "SHORT": "做空",
+
+    # 系统状态
+    "User interrupt": "用户中断",
+    "System Error": "系统错误",
+    "System Shutdown": "系统关闭",
+    "Trading Error": "交易错误",
+
+    # 其他常见
+    "Reason": "原因",
+    "Side": "方向",
+    "Price": "价格",
+    "Qty": "数量",
+    "Size": "名义金额",
+    "EdgeGate State": "EdgeGate 状态",
+}
+
+# ===============================
+# 配置
+# ===============================
+@dataclass
+class AlertConfig:
+    enabled: bool
+    bot_token: Optional[str]
+    chat_id: Optional[str]
+    level: str = "INFO"
+
+
+class AlertManager:
+    """
+    中文增强版 AlertManager
+
+    - 保持原有接口不变（runner 无需修改）
+    - Telegram 通知自动中文化
+    - 支持 INFO / WARNING / ERROR / FATAL
+    """
+
+    def __init__(
+        self,
+        enabled: bool = True,
+        bot_token: Optional[str] = None,
+        chat_id: Optional[str] = None,
+        level: str = "INFO",
+    ) -> None:
+        level = (level or "INFO").upper()
+        self.config = AlertConfig(
+            enabled=bool(enabled and bot_token and chat_id),
+            bot_token=bot_token,
+            chat_id=chat_id,
+            level=level,
+        )
+
+        logger.info(
+            "[AlertManager] initialized enabled=%s level=%s chat_id=%s",
+            self.config.enabled,
+            self.config.level,
+            self.config.chat_id,
+        )
+
+    # ===============================
+    # 内部工具
+    # ===============================
+    def _should_send(self, level: str) -> bool:
+        if not self.config.enabled:
+            return False
+        cur = _LEVEL_ORDER.get(self.config.level, 20)
+        incoming = _LEVEL_ORDER.get((level or "INFO").upper(), 20)
+        return incoming >= cur
+
+    def _translate_cn(self, text: str) -> str:
+        """
+        将告警文本中的英文关键字替换为中文
+        """
+        if not text:
+            return text
+
+        for k, v in _CN_TRANSLATE_MAP.items():
+            if k in text:
+                text = text.replace(k, v)
+
+        return text
+
+    def _post_telegram(self, text: str) -> None:
+        if not (self.config.bot_token and self.config.chat_id):
+            logger.debug("[AlertManager] telegram disabled or missing token/chat_id")
+            return
+
+        url = f"https://api.telegram.org/bot{self.config.bot_token}/sendMessage"
+        payload = {"chat_id": self.config.chat_id, "text": text}
+        try:
+            r = requests.post(url, data=payload, timeout=10)
+            r.raise_for_status()
+        except Exception as e:
+            logger.error("[ALERT ERROR] Failed to send Telegram alert: %s", e)
+
+    # ===============================
+    # 基础接口
+    # ===============================
+    def send(self, level: str, text: str) -> None:
+        try:
+            if not self._should_send(level):
+                return
+            text = self._translate_cn(text)
+            self._post_telegram(text)
+        except Exception as e:
+            logger.exception("[AlertManager] unexpected error in send: %s", e)
+
+    def debug(self, text: str) -> None:
+        logger.debug(text)
+        self.send("DEBUG", text)
+
+    def info(self, text: str) -> None:
+        logger.info(text)
+        self.send("INFO", text)
+
+    def warning(self, text: str) -> None:
+        logger.warning(text)
+        self.send("WARNING", text)
+
+    def error(self, text: str) -> None:
+        logger.error(text)
+        self.send("ERROR", text)
+
+    # ===============================
+    # 兼容 runner 的 send_alert
+    # ===============================
+    def send_alert(
+        self,
+        level,
+        title: str,
+        message: str,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        try:
+            level_name = getattr(level, "name", None) or str(level)
+            level_name = (level_name or "INFO").upper()
+
+            prefix = f"[{level_name}] {title}".strip()
+            text = prefix
+
+            if message:
+                text = f"{prefix}\n\n{message}"
+
+            if extra:
+                try:
+                    extra_str = json.dumps(extra, ensure_ascii=False, default=str)
+                    text += f"\n\n附加信息：{extra_str}"
+                except Exception:
+                    pass
+
+            text = self._translate_cn(text)
+
+            if "ERROR" in level_name or "FATAL" in level_name:
+                self.error(text)
+            elif "WARN" in level_name:
+                self.warning(text)
+            elif "DEBUG" in level_name:
+                self.debug(text)
+            else:
+                self.info(text)
+
+        except Exception as e:
+            logger.exception("[AlertManager] unexpected error in send_alert: %s", e)
+
+    # ===============================
+    # 语义告警（业务级）
+    # ===============================
+    def alert_system_startup(self, trading_mode: str, run_id: str) -> None:
+        msg = (
+            "【系统启动】\n\n"
+            f"运行模式：{trading_mode}\n"
+            f"运行ID：{run_id}"
+        )
+        self.info(msg)
+
+    def alert_quota_exhausted(self, symbol: str, remaining: int) -> None:
+        msg = (
+            "【风险提示｜当日额度已用完】\n\n"
+            f"交易对：{symbol}\n"
+            f"今日剩余下单次数：{remaining}\n\n"
+            "系统已自动停止该交易对的新开仓操作"
+        )
+        self.warning(msg)
+
+    def alert_order_placed(
+        self,
+        symbol: str,
+        side: str,
+        size_usd: float,
+        entry_price: float,
+        trading_mode: str,
+    ) -> None:
+        msg = (
+            "【新订单已提交】\n\n"
+            f"交易模式：{trading_mode}\n"
+            f"交易对：{symbol}\n"
+            f"方向：{side}\n"
+            f"名义金额：{size_usd:.2f} USDT\n"
+            f"入场价格：{entry_price}"
+        )
+        self.info(msg)
+
+    def alert_fatal_error(self, message: str) -> None:
+        self.error(f"【致命错误】{message}")
+
+    def alert_system_shutdown(self, reason: str = "未知原因") -> None:
+        """系统关闭通知"""
+        msg = (
+            "【系统关闭】\n\n"
+            f"关闭原因：{self._translate_cn(reason)}\n"
+            f"关闭时间：{self._get_current_time()}"
+        )
+        self.warning(msg)
+
+    def _get_current_time(self) -> str:
+        """获取当前时间的格式化字符串"""
+        from datetime import datetime
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
