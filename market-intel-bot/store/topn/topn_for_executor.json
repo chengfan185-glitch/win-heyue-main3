@@ -1,0 +1,13 @@
+{
+  "symbol": "SOLUSDT",
+  "score": 1.23,
+  "direction": "SHORT",
+  "confidence": 0.72,
+  "timeframe": "15m",
+  "mark_price": 142.15,
+  "volatility": 0.012,
+  "suggested_notional_usdt": 20,
+  "tp_pct": 0.0045,
+  "sl_pct": 0.0025,
+  "ts": 1768748307.9
+}

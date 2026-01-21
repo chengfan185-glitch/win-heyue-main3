@@ -1,0 +1,13 @@
+{
+  "time": "2026-01-19T04:07:02",
+  "timeframe": "15m",
+  "topn": [],
+  "ts": 1768766822.2516375,
+  "universe_size": 80,
+  "weights": {
+    "w_breakout": 0.8,
+    "w_noise": 0.7,
+    "w_trend": 1.0,
+    "w_vol": 0.6
+  }
+}

@@ -1,0 +1,30 @@
+# market-intel-bot .env.example
+
+# 数据源
+EXCHANGE=binance_um
+BASE_URL=https://fapi.binance.com
+
+# Universe
+SYMBOLS=SOLUSDT,ETHUSDT,XRPUSDT,BNBUSDT,ADAUSDT,DOGEUSDT,LINKUSDT,AVAXUSDT,MATICUSDT
+INTERVALS=1m,5m,15m
+
+# 采集频率
+COLLECT_EVERY_SEC=30
+COMPUTE_EVERY_SEC=60
+RANK_EVERY_SEC=60
+
+# 存储
+STORE=sqlite
+SQLITE_PATH=data/market.db
+RETENTION_DAYS_1M=7
+
+# 输出给下单工具人
+SIGNAL_OUT_PATH=../win-heyue-main3/signals/latest.json
+TOP_N=10
+MIN_SCORE=0.65
+
+# 评分参数（先规则）
+MIN_VOL=0.0005
+MAX_VOL=0.01
+MIN_PC_15M=0.00015
+VOL_RATIO_MIN=1.2

@@ -1,0 +1,10 @@
+python-dotenv>=1.0.1
+requests>=2.32.0
+pandas>=2.1.0
+numpy>=1.26.0
+pydantic>=2.6.0
+tenacity>=8.2.0
+rich>=13.7.0
+orjson>=3.10.0
+# Optional (only if you enable LLM summarizer)
+openai>=1.40.0
