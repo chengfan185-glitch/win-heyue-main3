@@ -16,6 +16,7 @@ from pipeline.ranker import rank
 from src.settings import load_settings
 from src.store import CooldownState, load_state, save_state, write_json
 from ops.publisher import publish_file, publish_webhook
+# Market intel AI module for periodic review
 import market_intel_ai
 
 
@@ -181,11 +182,8 @@ def main() -> None:
                     # Attach to payload
                     payload["ai_intel"] = ai_result
                     
-                    # Persist AI result
+                    # Persist AI result (write_json handles directory creation)
                     try:
-                        dir_path = os.path.dirname(cfg.market_intel_ai_output_file)
-                        if dir_path:
-                            os.makedirs(dir_path, exist_ok=True)
                         write_json(cfg.market_intel_ai_output_file, ai_result)
                     except Exception as e:
                         console.print(f"[{_now_iso()}] [yellow]AI output write failed[/yellow]: {e}")
