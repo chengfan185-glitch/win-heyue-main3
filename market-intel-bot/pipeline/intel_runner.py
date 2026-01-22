@@ -183,7 +183,9 @@ def main() -> None:
                     
                     # Persist AI result
                     try:
-                        os.makedirs(os.path.dirname(cfg.market_intel_ai_output_file), exist_ok=True)
+                        dir_path = os.path.dirname(cfg.market_intel_ai_output_file)
+                        if dir_path:
+                            os.makedirs(dir_path, exist_ok=True)
                         write_json(cfg.market_intel_ai_output_file, ai_result)
                     except Exception as e:
                         console.print(f"[{_now_iso()}] [yellow]AI output write failed[/yellow]: {e}")

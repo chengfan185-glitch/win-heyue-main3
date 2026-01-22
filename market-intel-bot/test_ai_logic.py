@@ -131,7 +131,9 @@ def test_ai_output_file_write():
         }
         
         # Simulate the write logic
-        os.makedirs(os.path.dirname(output_file), exist_ok=True)
+        dir_path = os.path.dirname(output_file)
+        if dir_path:
+            os.makedirs(dir_path, exist_ok=True)
         with open(output_file, 'w') as f:
             json.dump(ai_result, f, indent=2)
         
