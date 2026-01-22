@@ -7,12 +7,17 @@ from typing import Any, Dict
 
 shared_dir = Path(__file__).resolve().parent
 repo_root = shared_dir.parent.parent
-if not repo_root.exists():
+git_marker = repo_root / ".git"
+if not repo_root.exists() or not git_marker.exists():
     raise RuntimeError(f"[INTEL-BRIDGE] repo root not found: {repo_root}")
 
 DST_DEFAULT_TOPN = shared_dir / "topn.json"
 DST_DEFAULT_AI = shared_dir / "ai_intel.json"
-SRC_DEFAULT = repo_root / "market-intel-bot" / "store" / "topn" / "latest.json"
+market_intel_dir = repo_root / "market-intel-bot"
+if not market_intel_dir.exists():
+    raise RuntimeError(f"[INTEL-BRIDGE] market-intel-bot dir not found: {market_intel_dir}")
+
+SRC_DEFAULT = market_intel_dir / "store" / "topn" / "latest.json"
 
 SRC = Path(os.getenv("INTEL_BRIDGE_SRC", str(SRC_DEFAULT)))
 DST_TOPN = Path(os.getenv("INTEL_BRIDGE_DST_TOPN", str(DST_DEFAULT_TOPN)))
@@ -32,6 +37,8 @@ def main() -> None:
     print(f"[INTEL-BRIDGE] SRC={SRC}")
     print(f"[INTEL-BRIDGE] DST_TOPN={DST_TOPN}")
     print(f"[INTEL-BRIDGE] DST_AI={DST_AI}")
+    if not SRC.exists():
+        raise RuntimeError(f"[INTEL-BRIDGE] source topn file not found: {SRC}")
     last_mtime = 0.0
 
     while True:
