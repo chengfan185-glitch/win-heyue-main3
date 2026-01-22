@@ -1,0 +1,13 @@
+{
+  "time": "2026-01-22T19:43:16",
+  "global_hold": false,
+  "hold_reason": "openai_risk_off: Data quality is excellent (100% fetch success), but there are no TOP CANDIDATES or REGIME DETAILS provided. With an empty candidate set and no allowed_actions/regime context, the system cannot validate trend conditions or avoid range/contradictory signals. To prevent uninformed entr",
+  "symbols": [],
+  "topn": [],
+  "signals": {},
+  "picks": [],
+  "meta": {
+    "src_age_sec": 143.50679397583008,
+    "regime_age_sec": 143.50328278541565
+  }
+}

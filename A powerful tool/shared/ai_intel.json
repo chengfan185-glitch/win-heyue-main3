@@ -1,0 +1,16 @@
+{
+  "time": "2026-01-22T16:22:55",
+  "ts": 1769070175.1116674,
+  "topn": [],
+  "global_hold": false,
+  "hold_reason": "",
+  "review": {
+    "enabled": false,
+    "time": "2026-01-22T16:19:44"
+  },
+  "meta": {
+    "publisher": "publish_intel_to_shared.py",
+    "base_dir": "C:\\Users\\ASUS\\Desktop\\market-intel-bot",
+    "src_topn_mtime": 1769069984.9940655
+  }
+}

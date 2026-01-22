@@ -1,0 +1,68 @@
+{
+  "time": "2026-01-21T13:06:58+08:00",
+  "timeframe": "15m",
+  "topn": [
+    {
+      "symbol": "AXSUSDT",
+      "direction": "LONG",
+      "confidence": 0.9,
+      "reason": "Highest edge_score and expected move, noise_score slightly above 0.5 but overall trend strong."
+    },
+    {
+      "symbol": "XMRUSDT",
+      "direction": "LONG",
+      "confidence": 0.75,
+      "reason": "Strong edge_score with moderate noise_score under 0.5 and clear trend regime."
+    },
+    {
+      "symbol": "ATOMUSDT",
+      "direction": "LONG",
+      "confidence": 0.7,
+      "reason": "Edge_score solid, noise just above 0.5, but trend confirmed."
+    },
+    {
+      "symbol": "IOTAUSDT",
+      "direction": "LONG",
+      "confidence": 0.65,
+      "reason": "Lower edge_score with noise below 0.5, trend regime stable."
+    },
+    {
+      "symbol": "ENJUSDT",
+      "direction": "LONG",
+      "confidence": 0.65,
+      "reason": "Edge_score moderate, noise high >0.5, trend confirmed."
+    },
+    {
+      "symbol": "CHZUSDT",
+      "direction": "LONG",
+      "confidence": 0.6,
+      "reason": "Moderate edge_score, noise above 0.5, trend stable."
+    },
+    {
+      "symbol": "SNXUSDT",
+      "direction": "LONG",
+      "confidence": 0.6,
+      "reason": "Moderate edge_score and noise above 0.5, trend regime."
+    },
+    {
+      "symbol": "DENTUSDT",
+      "direction": "LONG",
+      "confidence": 0.6,
+      "reason": "Lower edge with noise above 0.5, trend stable."
+    },
+    {
+      "symbol": "SUSHIUSDT",
+      "direction": "LONG",
+      "confidence": 0.55,
+      "reason": "Low edge_score with noise slightly above 0.5, trend regime."
+    },
+    {
+      "symbol": "BELUSDT",
+      "direction": "LONG",
+      "confidence": 0.55,
+      "reason": "Lowest edge_score among top candidates with elevated noise, trend confirmed."
+    }
+  ],
+  "provider": "openai",
+  "model": "gpt-4.1-mini"
+}
