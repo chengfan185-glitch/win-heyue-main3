@@ -25,6 +25,10 @@ console = Console()
 # Module-level tracker for AI review timing
 _last_ai_review_ts = 0.0
 
+# AI review constants
+_MIN_REVIEW_INTERVAL_SECONDS = 60
+_RISK_OFF_STATES = ("risk_off", "risk-off", "risk off")
+
 
 def _now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
@@ -164,7 +168,7 @@ def main() -> None:
         try:
             if cfg.enable_market_intel_ai:
                 now_ts = time.time()
-                review_every = max(60, int(cfg.market_intel_ai_review_seconds))
+                review_every = max(_MIN_REVIEW_INTERVAL_SECONDS, int(cfg.market_intel_ai_review_seconds))
                 global _last_ai_review_ts
                 if (_last_ai_review_ts == 0.0) or (now_ts - _last_ai_review_ts >= review_every):
                     ai_snapshot = {
@@ -193,15 +197,15 @@ def main() -> None:
                         except Exception:
                             ms = None
 
-                        if ms in ("risk_off", "risk-off", "risk off"):
+                        if ms in _RISK_OFF_STATES:
                             payload["global_hold"] = True
                             payload["intel_global_hold"] = True
 
                         _last_ai_review_ts = now_ts
                     except Exception as e:
                         console.print(f"[{_now_iso()}] [yellow]ai review failed[/yellow]: {e}")
-        except Exception:
-            pass
+        except Exception as e:
+            console.print(f"[{_now_iso()}] [yellow]ai review wrapper error[/yellow]: {e}")
 
         # Persist
         publish_file(cfg.topn_file, payload)
