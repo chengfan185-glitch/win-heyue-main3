@@ -1,0 +1,2247 @@
+# pipeline/futures_runner_v2.py
+"""
+Production-Grade Binance Futures Trading Runner
+"""
+
+from __future__ import annotations
+
+# ==========================================================
+# 🔥 ENV BOOTSTRAP (MUST BE BEFORE ANY os.getenv CALL)
+# ==========================================================
+import os
+import sys
+from pathlib import Path
+
+# Ensure project root is on sys.path so `shared` can be imported
+# Works for both: `python -m pipeline.futures_runner_v4` and `python pipeline\futures_runner_v4.py`
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+from dotenv import load_dotenv
+from shared.intel_reader import load_topn_symbols, load_ai_intel
+
+# 强制加载 .env（覆盖系统 / 旧 shell 变量）
+load_dotenv(".env", override=False)
+
+print(
+    "[ENV BOOT]",
+    "TRADING_MODE =", os.getenv("TRADING_MODE"),
+    "| ENABLE_REAL_TRADING =", os.getenv("ENABLE_REAL_TRADING"),
+)
+
+# ==========================================================
+# Standard imports (AFTER env loaded)
+# ==========================================================
+import sys
+import time
+import json
+import random
+import atexit
+import traceback
+import logging
+from pathlib import Path
+from datetime import datetime, timezone
+from typing import List, Optional, Dict, Any, Literal, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import requests
+
+logger = logging.getLogger(__name__)
+
+# --- Runtime cooldown markers (UTC) ---
+# Updated when a position is opened/closed successfully.
+LAST_ENTRY_UTC = None  # type: Optional[datetime]
+LAST_EXIT_UTC = None   # type: Optional[datetime]
+# ------------------------------
+# Always-send shutdown alert (catch all exit paths)
+# ------------------------------
+_shutdown_sent = {"ok": False}
+
+def _send_shutdown(reason: str):
+    if _shutdown_sent["ok"]:
+        return
+    _shutdown_sent["ok"] = True
+    try:
+        # use compatibility method you already have
+        alerts.alert_system_shutdown(reason)  # type: ignore[attr-defined]
+    except Exception:
+        # fallback: try direct send_alert if available
+        try:
+            alerts.send_alert(AlertLevel.WARN, "[SHUTDOWN]", reason)
+        except Exception:
+            pass
+
+# atexit covers normal exit / sys.exit / unhandled exceptions that terminate process
+try:
+    atexit.register(lambda: _send_shutdown("Process exiting (atexit)."))
+except Exception:
+    pass
+
+def ensure_alert_manager_compat(alerts) -> None:
+    """
+    兼容补丁：如果 AlertManager 实例上缺少新版 runner 需要的高层方法，
+    在这里按旧接口封装一层挂上去，避免 AttributeError。
+    Added extra shims: alert_reconciliation_failed, alert_order_failed, alert_system_shutdown.
+    """
+    # 系统启动
+    if not hasattr(alerts, "alert_system_startup"):
+        def _alert_system_startup(trading_mode: str, run_id: str) -> None:
+            text = (
+                "[INFO] 交易系统已启动\n\n"
+                f"运行模式：{trading_mode}\n"
+                f"运行ID： {run_id}"
+            )
+            # 老版本至少有 info()
+            if hasattr(alerts, "info"):
+                alerts.info(text)
+            else:
+                print(text)
+        alerts.alert_system_startup = _alert_system_startup  # type: ignore[attr-defined]
+
+    # 系统关闭（保证 finally 中调用存在）
+    if not hasattr(alerts, "alert_system_shutdown"):
+        def _alert_system_shutdown(reason: str) -> None:
+            text = f"[INFO] 交易系统已关闭：{reason}"
+            if hasattr(alerts, "info"):
+                alerts.info(text)
+            else:
+                print(text)
+        alerts.alert_system_shutdown = _alert_system_shutdown  # type: ignore[attr-defined]
+
+    # 当日额度用完
+    if not hasattr(alerts, "alert_quota_exhausted"):
+        def _alert_quota_exhausted(symbol: str, remaining: int) -> None:
+            text = (
+                "[WARNING] Quota Exhausted\n\n"
+                f"Daily quota exhausted for {symbol}\n"
+                f"Remaining quota (report)：{remaining}"
+            )
+            if hasattr(alerts, "warning"):
+                alerts.warning(text)
+            else:
+                print(text)
+        alerts.alert_quota_exhausted = _alert_quota_exhausted  # type: ignore[attr-defined]
+
+    # 下单成功
+    if not hasattr(alerts, "alert_order_placed"):
+        def _alert_order_placed(
+            symbol: str,
+            side: str,
+            size_usdt: float,
+            entry_price: float,
+            trading_mode: str,
+        ) -> None:
+            text = (
+                "[ORDER] 新订单已提交\n\n"
+                f"模式：{trading_mode}\n"
+                f"品种：{symbol}\n"
+                f"方向：{side}\n"
+                f"名义金额：{size_usdt:.2f} USDT\n"
+                f"入场价：{entry_price}"
+            )
+            if hasattr(alerts, "info"):
+                alerts.info(text)
+            else:
+                print(text)
+        alerts.alert_order_placed = _alert_order_placed  # type: ignore[attr-defined]
+
+    # 下单失败（补充）
+    if not hasattr(alerts, "alert_order_failed"):
+        def _alert_order_failed(symbol: str, message: str) -> None:
+            text = (
+                "[ORDER FAILED]\n\n"
+                f"Symbol: {symbol}\n"
+                f"Error: {message}"
+            )
+            if hasattr(alerts, "error"):
+                alerts.error(text)
+            elif hasattr(alerts, "warning"):
+                alerts.warning(text)
+            else:
+                print(text)
+        alerts.alert_order_failed = _alert_order_failed  # type: ignore[attr-defined]
+
+    # 对账失败（补充）
+    if not hasattr(alerts, "alert_reconciliation_failed"):
+        def _alert_reconciliation_failed(report: str) -> None:
+            text = "[RECONCILIATION FAILED]\n\n" + str(report)
+            # Prefer error, fallback to warning/info/print
+            if hasattr(alerts, "error"):
+                alerts.error(text)
+            elif hasattr(alerts, "warning"):
+                alerts.warning(text)
+            elif hasattr(alerts, "info"):
+                alerts.info(text)
+            else:
+                print(text)
+        alerts.alert_reconciliation_failed = _alert_reconciliation_failed  # type: ignore[attr-defined]
+
+    # 致命错误
+    if not hasattr(alerts, "alert_fatal_error"):
+        def _alert_fatal_error(message: str) -> None:
+            text = f"[FATAL] {message}"
+            if hasattr(alerts, "error"):
+                alerts.error(text)
+            else:
+                print(text)
+        alerts.alert_fatal_error = _alert_fatal_error  # type: ignore[attr-defined]
+
+    # 平仓通知
+    if not hasattr(alerts, "alert_position_closed"):
+        def _alert_position_closed(
+            symbol: str,
+            side: str,
+            entry_price: float,
+            exit_price: float,
+            pnl_usdt: float,
+            reason: str,
+            trading_mode: str,
+        ) -> None:
+            msg = (
+                "📤 平仓完成\n\n"
+                f"模式：{trading_mode}\n"
+                f"品种：{symbol}\n"
+                f"方向：{side}\n"
+                f"开仓价：{entry_price}\n"
+                f"平仓价：{exit_price}\n"
+                f"盈亏：{pnl_usdt:.2f} USDT\n"
+                f"原因：{reason}"
+            )
+            if hasattr(alerts, "info"):
+                alerts.info(msg)
+            else:
+                print(msg)
+        alerts.alert_position_closed = _alert_position_closed  # type: ignore[attr-defined]
+
+
+
+def fetch_okx_klines_and_features(symbol: str, interval: str) -> dict:
+    """
+    Fetch klines from OKX and compute features
+    OKX bar examples:
+      1m, 3m, 5m, 15m, 30m, 1H, 2H, 4H, 6H, 12H, 1D, ...
+    """
+    inst = symbol.replace("USDT", "-USDT")
+    url = "https://www.okx.com/api/v5/market/candles"
+
+    # 简单映射：内部用 15m / 45m / 1h / 3h
+    bar_map = {
+        "15m": "15m",
+        "45m": "45m",   # OKX 支持 45m
+        "1h": "1H",
+        "3h": "3H",
+    }
+    bar = bar_map.get(interval, "15m")
+
+    params = {
+        "instId": inst,
+        "bar": bar,
+        "limit": "50",
+    }
+
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+
+        if data.get("code") != "0":
+            return {}
+
+        candles = data.get("data", [])
+        if len(candles) < 2:
+            return {}
+
+        # OKX candle format:
+        # [ts, open, high, low, close, vol, volCcy, volCcyQuote, confirm]
+        prev = candles[-2]
+        curr = candles[-1]
+
+        open_p = float(curr[1])
+        high = float(curr[2])
+        low = float(curr[3])
+        close = float(curr[4])
+
+        prev_close = float(prev[4])
+
+        price_change = (close - prev_close) / max(prev_close, 1e-9)
+        volatility = (high - low) / max(open_p, 1e-9)
+
+        return {
+            "price_change": price_change,
+            "volatility": volatility,
+            "close": close,
+
+            # 为策略 / ML 提供“潜在 edge 线索”
+            "raw_edge_hint": price_change,   # 或你后面算的 signal
+        }
+    except Exception as e:
+        print(f"[OKX_KLINE] Error fetching {symbol} {interval}: {e}")
+        return {}
+
+
+# Path bootstrap
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+# Ensure .env is loaded
+from core.config.env_loader import load_env
+load_env(str(ROOT / ".env"), override=False)
+
+# Core infrastructure
+from core.ledger.trade_ledger import TradeLedger, Order, Position, Trade, BOT_PROFILE_NAME
+from core.ledger.reconciliation import StateReconciliation, ReconciliationMode
+from core.authority.entry_authority import EntryAuthority
+from core.execution.order_executor import OrderExecutor
+from core.observability.metrics import MetricsCollector
+from core.observability.alerts import AlertManager, AlertLevel
+from core.utils.time import now_shanghai, format_dt_shanghai, shanghai_local_date
+from risk.edge_gate import edge_cost_gate
+from risk.edge_gate_v2 import EdgeGateV2, create_default_edge_gate_v2
+from risk.edge_stats import EdgeStats, create_default_edge_stats
+from risk.edge_gate_diagnostics import EdgeGateDiagnostics, create_default_diagnostics
+
+# Cost model (orderbook-based)
+try:
+    from risk.cost_model_orderbook import (
+        CostInput, OrderBookSnap, estimate_cost_from_orderbook, append_cost_log_jsonl
+    )
+    _COST_MODEL_AVAILABLE = True
+except Exception as _e:
+    _COST_MODEL_AVAILABLE = False
+    CostInput = None  # type: ignore
+    OrderBookSnap = None  # type: ignore
+    estimate_cost_from_orderbook = None  # type: ignore
+    append_cost_log_jsonl = None  # type: ignore
+
+# Futures adapters
+from execution.adapters.binance_um_futures import BinanceUMFuturesAdapter
+from execution.adapters.binance_cm_futures import BinanceCMFuturesAdapter
+from market.adapters.binance_futures_kline import (
+    BinanceFuturesKlineFetcher,
+    fetch_futures_price,
+)
+from risk.implementations.futures_risk import FuturesRiskManager
+
+# ============================================
+# Configuration
+# ============================================
+
+# ------------------------------
+# Cost Model (Orderbook) Config
+# ------------------------------
+COST_MODEL_ENABLED = os.getenv('COST_MODEL_ENABLED', 'true').lower() in ('1','true','yes')
+COST_LOG_PATH = os.getenv('COST_LOG_PATH', 'logs/cost_estimates.jsonl')
+COST_DEPTH_LIMIT = int(os.getenv('COST_DEPTH_LIMIT', '50'))
+MAKER_FEE_RATE = float(os.getenv('MAKER_FEE_RATE', '0.0002'))  # 0.02%
+TAKER_FEE_RATE = float(os.getenv('TAKER_FEE_RATE', '0.0004'))  # 0.04%
+EXPECTED_TAKER_RATIO = float(os.getenv('EXPECTED_TAKER_RATIO', '1.0'))
+EDGE_GATE_FIXED_FEE_PCT = float(os.getenv('EDGE_GATE_FIXED_FEE_PCT', '0.0013'))  # fallback
+
+
+# Trading mode
+TRADING_MODE: Literal["paper", "testnet", "live"] = (
+    os.getenv("TRADING_MODE", "paper").lower()
+)
+if TRADING_MODE not in ("paper", "testnet", "live"):
+    TRADING_MODE = "paper"
+
+# Market type
+FUTURES_MARKET_TYPE: Literal["UM", "CM"] = (
+    os.getenv("FUTURES_MARKET_TYPE", "UM").upper()
+)
+if FUTURES_MARKET_TYPE not in ("UM", "CM"):
+    FUTURES_MARKET_TYPE = "UM"
+
+
+def _parse_symbols(raw: str) -> List[str]:
+    raw = (raw or "").strip()
+    if not raw:
+        return [] 
+    if raw.startswith("["):
+        try:
+            arr = json.loads(raw)
+            return [str(x).strip().upper() for x in arr if str(x).strip()]
+        except Exception:
+            pass
+    return [s.strip().upper() for s in raw.split(",") if s.strip()]
+
+
+SYMBOLS = _parse_symbols(os.getenv("SYMBOLS", ""))
+if not SYMBOLS:
+    raise SystemExit('No symbols configured. Set env SYMBOLS like: SYMBOLS=SOLUSDT,ETHUSDT')
+# EdgeGate v2 constants for insufficient samples fallback
+EDGEGATE_V2_INSUFFICIENT_SAMPLES_PERCENTILE = 0.60  # Force minimum percentile to avoid BLOCK
+EDGEGATE_V2_INSUFFICIENT_SAMPLES_MIN_EDGE = 0.0001  # Minimum positive edge for PROBE
+
+# Interval
+INTERVAL = os.getenv("INTERVAL", "15m")
+SUPPORTED_INTERVALS = ["15m", "45m", "1h", "3h"]
+if INTERVAL not in SUPPORTED_INTERVALS:
+    print(f"[WARN] Unsupported interval {INTERVAL}, using 15m")
+    INTERVAL = "15m"
+
+# Leverage and margin
+MAX_LEVERAGE = int(os.getenv("MAX_LEVERAGE", "2"))
+MARGIN_TYPE: Literal["ISOLATED", "CROSSED"] = (
+    os.getenv("MARGIN_TYPE", "ISOLATED").upper()
+)
+
+# Position sizing
+AMOUNT_USDT = float(os.getenv("AMOUNT_USDT", "20"))
+
+# Real trading
+ENABLE_REAL_TRADING = os.getenv("ENABLE_REAL_TRADING", "false").lower() == "true"
+
+# Daily quota
+DAILY_ORDER_QUOTA = int(os.getenv("DAILY_ORDER_QUOTA", "3"))
+
+# Kill switch
+KILL_SWITCH = os.getenv("KILL_SWITCH", "false").lower() == "true"
+
+# Batch settings
+BATCH_FETCH_CONCURRENT = (
+    os.getenv("BATCH_FETCH_CONCURRENT", "true").lower() == "true"
+)
+BATCH_MAX_WORKERS = int(os.getenv("BATCH_MAX_WORKERS", "10"))
+BATCH_SHUFFLE_SYMBOLS = os.getenv("BATCH_SHUFFLE_SYMBOLS", "true").lower() == "true"
+BATCH_SLEEP_CHOICES = os.getenv("BATCH_SLEEP_CHOICES", "60,90,120,150,180,240,300").strip()
+# >>> 新增：启动冷静期（分钟） <<<
+STARTUP_WARMUP_MINUTES = int(os.getenv("STARTUP_WARMUP_MINUTES", "0"))
+
+# >>> 新增：交易冷静期 / 安全观察期（秒） <<<
+# - COOLDOWN_AFTER_ENTRY_SECONDS: 每次开仓后，强制等待一段时间才允许下一次开仓
+# - COOLDOWN_AFTER_EXIT_SECONDS : 每次平仓后，强制等待一段时间才允许下一次开仓
+# 均为 0 表示关闭该约束。
+COOLDOWN_AFTER_ENTRY_SECONDS = int(os.getenv("COOLDOWN_AFTER_ENTRY_SECONDS", "0"))
+COOLDOWN_AFTER_EXIT_SECONDS = int(os.getenv("COOLDOWN_AFTER_EXIT_SECONDS", "0"))
+
+# >>> 新增：交易所剩余仓位品种数上限（默认 5，可调 10） <<<
+MAX_ACTIVE_SYMBOLS = int(os.getenv("MAX_ACTIVE_SYMBOLS", "5"))
+
+# >>> 新增：强制单一方向（Direction-Bound） <<<
+ENFORCE_SINGLE_DIRECTION = os.getenv("ENFORCE_SINGLE_DIRECTION", "true").lower() in ("1", "true", "yes")
+
+
+def _parse_sleep_choices(raw: str) -> List[int]:
+    raw = (raw or "").strip()
+    if not raw:
+        return [60, 90, 120, 150, 180, 240, 300]
+    items: List[int] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            v = int(float(part))
+            if v > 0:
+                items.append(v)
+        except Exception:
+            continue
+    return items if items else [60, 90, 120, 150, 180, 240, 300]
+
+
+_SLEEP_CHOICES = _parse_sleep_choices(BATCH_SLEEP_CHOICES)
+
+
+def next_round_sleep_sec() -> int:
+    return int(random.choice(_SLEEP_CHOICES))
+
+
+# ============================================
+# Quota Management
+# ============================================
+
+QUOTA_FILE = Path("logs/daily_quota.json")
+
+
+def _quota_today_key() -> str:
+    """Get today's date key in Shanghai timezone for quota tracking"""
+    return shanghai_local_date()
+
+
+def get_remaining_quota() -> int:
+    """Get remaining daily quota"""
+    if not QUOTA_FILE.exists():
+        QUOTA_FILE.parent.mkdir(parents=True, exist_ok=True)
+        state = {"date": _quota_today_key(), "remaining": DAILY_ORDER_QUOTA}
+        QUOTA_FILE.write_text(json.dumps(state))
+        return DAILY_ORDER_QUOTA
+
+    try:
+        state = json.loads(QUOTA_FILE.read_text())
+        if state.get("date") != _quota_today_key():
+            state = {"date": _quota_today_key(), "remaining": DAILY_ORDER_QUOTA}
+            QUOTA_FILE.write_text(json.dumps(state))
+        return max(0, int(state.get("remaining", 0)))
+    except Exception:
+        return 0
+
+
+def dec_quota() -> int:
+    """Decrement quota after successful order"""
+    if not QUOTA_FILE.exists():
+        return 0
+
+    try:
+        state = json.loads(QUOTA_FILE.read_text())
+        remaining = max(0, int(state.get("remaining", 0)) - 1)
+        state["remaining"] = remaining
+        state["date"] = _quota_today_key()
+        QUOTA_FILE.write_text(json.dumps(state))
+        return remaining
+    except Exception:
+        return 0
+
+
+# ============================================
+# Helper Functions
+# ============================================
+
+def _fmt_ts(now_utc: datetime) -> str:
+    """Format timestamp as Shanghai time with +08:00 offset"""
+    try:
+        return format_dt_shanghai(now_utc)
+    except Exception:
+        return now_utc.isoformat()
+
+
+def _tpsl_dev_ok(entry: float, level: Optional[float], max_dev: float = 0.20) -> bool:
+    """
+    Sanity-check TP/SL absolute levels vs entry.
+    max_dev=0.20 means allow within +/-20% of entry.
+    """
+    if level is None:
+        return True
+    if entry <= 0:
+        return False
+    try:
+        return abs(level / entry - 1.0) <= max_dev
+    except Exception:
+        return False
+
+
+# ======= NEW HELPERS: validation and safe adapter parsing =======
+def _validate_position_before_open(position: Any) -> bool:
+    """
+    Ensure we never open a 'ghost' position with non-positive entry_price or quantity.
+    Return True if valid, False otherwise.
+    """
+    try:
+        status = getattr(position, "status", None) if not isinstance(position, dict) else position.get("status")
+        if status != "OPEN":
+            return True
+
+        qty = getattr(position, "quantity", None) if not isinstance(position, dict) else position.get("quantity")
+        entry_price = getattr(position, "entry_price", None) if not isinstance(position, dict) else position.get("entry_price")
+        symbol = getattr(position, "symbol", None) if not isinstance(position, dict) else position.get("symbol")
+        side = getattr(position, "side", None) if not isinstance(position, dict) else position.get("side")
+
+        if qty is None or qty <= 0:
+            logger.error("[RUNNER][LEDGER VALIDATION] invalid OPEN position: quantity=%s", qty)
+            return False
+        if entry_price is None or entry_price <= 0:
+            logger.error("[RUNNER][LEDGER VALIDATION] invalid OPEN position: entry_price=%s", entry_price)
+            return False
+        if not symbol or not side:
+            logger.error("[RUNNER][LEDGER VALIDATION] invalid OPEN position: missing symbol/side")
+            return False
+        return True
+    except Exception:
+        logger.exception("[RUNNER] exception validating position before open")
+        return False
+
+
+def _safe_extract(result: Any, *names: str, default: Any = None) -> Any:
+    """
+    Try to extract a field from adapter result supporting both attribute and dict-like results.
+    Tries provided names in order.
+    """
+    if result is None:
+        return default
+    for n in names:
+        try:
+            if isinstance(result, dict) and n in result:
+                return result[n]
+            if hasattr(result, n):
+                return getattr(result, n)
+            # common variant: camelCase
+            camel = "".join([part.capitalize() if i > 0 else part for i, part in enumerate(n.split("_"))])
+            if isinstance(result, dict) and camel in result:
+                return result[camel]
+            if hasattr(result, camel):
+                return getattr(result, camel)
+        except Exception:
+            continue
+    return default
+
+
+# ============================================
+# Features & Strategy
+# ============================================
+
+def fetch_futures_klines_and_features(symbol: str) -> Dict[str, Any]:
+    """Fetch Binance futures klines and compute features"""
+    if not symbol or symbol == "symbol":
+        raise ValueError(f"[KLINE] Invalid symbol: {symbol}")
+
+    fetcher = BinanceFuturesKlineFetcher(symbol, FUTURES_MARKET_TYPE)
+
+    try:
+        klines = fetcher.fetch_klines(INTERVAL, 50)
+
+        if not klines or len(klines) < 2:
+            return {}
+
+        prev = klines[-2]
+        curr = klines[-1]
+
+        price_change = (curr["close"] - prev["close"]) / max(prev["close"], 1e-9)
+        volume_change = (curr["volume"] - prev["volume"]) / max(prev["volume"], 1e-9)
+        volatility = (curr["high"] - curr["low"]) / max(curr["open"], 1e-9)
+
+        return {
+            "price_change": float(price_change),
+            "volume_change": float(volume_change),
+            "volatility": float(volatility),
+            "close": float(curr["close"]),
+            "volume": float(curr["volume"]),
+        }
+
+    except Exception as e:
+        print(f"[KLINE] Error fetching features for {symbol}: {e}")
+        return {}
+
+
+def decide_action(features: Dict[str, Any]) -> Tuple[str, float]:
+    """
+    Simple rule-based strategy
+    Returns: (action, confidence)
+    """
+    if not features:
+        print("[DECISION_DEBUG] features is empty -> HOLD")
+        return "HOLD", 0.0
+
+    # ------------------------------
+    # Robust feature pick (兼容多版本字段名)
+    # ------------------------------
+    price_change = features.get("price_change", None)
+    if price_change is None:
+        price_change = features.get("price_change_15m", None)
+    if price_change is None:
+        price_change = features.get("pc15", None)
+    if price_change is None:
+        price_change = 0.0
+
+    volatility = features.get("volatility", None)
+    if volatility is None:
+        volatility = features.get("volatility_15m", None)
+    if volatility is None:
+        volatility = features.get("v15", None)
+    if volatility is None:
+        volatility = 0.0
+
+    # 强制转 float，避免字符串/None 导致比较异常
+    try:
+        price_change = float(price_change)
+    except Exception:
+        price_change = 0.0
+    try:
+        volatility = float(volatility)
+    except Exception:
+        volatility = 0.0
+
+    # ------------------------------
+    # Thresholds from env
+    # ------------------------------
+    MIN_PC = float(os.getenv("RULE_PC_MIN", "0.0002"))
+    MAX_VOL = float(os.getenv("RULE_VOL_MAX", "0.01"))
+
+    # ------------------------------
+    # Debug: 每次都解释为什么 HOLD/出方向
+    # ------------------------------
+    try:
+        keys_preview = list(features.keys())[:12]
+    except Exception:
+        keys_preview = ["<unprintable keys>"]
+
+    print(
+        f"[DECISION_DEBUG] keys={keys_preview} "
+        f"price_change={price_change:.6f} volatility={volatility:.6f} "
+        f"MIN_PC={MIN_PC:.6f} MAX_VOL={MAX_VOL:.6f}"
+    )
+
+    # ------------------------------
+    # Rules
+    # ------------------------------
+    if abs(price_change) < MIN_PC:
+        print("[DECISION_DEBUG] HOLD: abs(price_change) < MIN_PC")
+        return "HOLD", 0.0
+
+    if volatility > MAX_VOL:
+        print("[DECISION_DEBUG] HOLD: volatility > MAX_VOL")
+        return "HOLD", 0.0
+
+    # ------------------------------
+    # Direction + confidence
+    # 让 confidence 随着 price_change 变大而提升（上限 0.8）
+    # ------------------------------
+    confidence = min(abs(price_change) / max(MIN_PC, 1e-12) * 0.5, 0.8)
+
+    if price_change > 0:
+        print(f"[DECISION_DEBUG] LONG: confidence={confidence:.3f}")
+        return "LONG", confidence
+    else:
+        print(f"[DECISION_DEBUG] SHORT: confidence={confidence:.3f}")
+        return "SHORT", confidence
+
+def _prefetch_symbol_pack(symbol: str) -> Dict[str, Any]:
+    """Prefetch price and features for a symbol"""
+    pack: Dict[str, Any] = {"symbol": symbol, "ok": False}
+
+    try:
+        pack["price"] = fetch_futures_price(symbol, FUTURES_MARKET_TYPE)
+    except Exception as e:
+        pack["error_price"] = str(e)
+        return pack
+
+    try:
+        # 预取特征用 Binance K 线，跑不通时再在主逻辑里走 OKX
+        pack["features"] = fetch_futures_klines_and_features(symbol)
+    except Exception as e:
+        pack["error_features"] = str(e)
+
+    pack["ok"] = True
+    return pack
+
+
+
+
+def _depth_to_orderbook_snap(depth: Dict[str, Any]) -> 'OrderBookSnap':
+    bids_raw = depth.get('bids') or []
+    asks_raw = depth.get('asks') or []
+    bids = [(float(px), float(qty)) for px, qty in bids_raw[:COST_DEPTH_LIMIT]]
+    asks = [(float(px), float(qty)) for px, qty in asks_raw[:COST_DEPTH_LIMIT]]
+    best_bid = bids[0][0] if bids else 0.0
+    best_ask = asks[0][0] if asks else 0.0
+    return OrderBookSnap(
+        best_bid=best_bid,
+        best_ask=best_ask,
+        bids=bids,
+        asks=asks,
+        ts_ms=int(depth.get('_ts_ms', 0) or 0),
+    )
+# ============================================
+# Trading Logic
+# ============================================
+
+def run_once_for_symbol(
+    symbol: str,
+    ledger: TradeLedger,
+    adapter: Any,
+    risk_manager: FuturesRiskManager,
+    alerts: AlertManager,
+    metrics: MetricsCollector,
+    edge_gate_v2: EdgeGateV2,
+    edge_stats: EdgeStats,
+    edge_diagnostics: EdgeGateDiagnostics,
+    *,
+    now_ts: Optional[datetime] = None,
+    prefetch: Optional[Dict[str, Any]] = None,
+    batch_id: Optional[int] = None,
+    can_open_new: bool = True, in_warmup: bool = False,
+):
+    """Execute one trading cycle for a symbol"""
+    global LAST_ENTRY_UTC, LAST_EXIT_UTC
+    now_ts = now_ts or datetime.now(timezone.utc)
+    
+    print(f"\n🚀 run_once_for_symbol | {symbol} | batch={batch_id}")
+
+    # --------------------------------------------------
+    # 1. Real-time price
+    # --------------------------------------------------
+    try:
+        if prefetch and prefetch.get("price") is not None:
+            real_price = float(prefetch["price"])
+        else:
+            real_price = fetch_futures_price(symbol, FUTURES_MARKET_TYPE)
+        print(f"[PRICE] {symbol} = {real_price}")
+        metrics.record_api_call(success=True)
+        global entry_price
+        entry_price = real_price  # 保险变量，兼容遗留代码路径
+    except Exception as e:
+        print(f"[PRICE ERROR] {symbol}: {e}")
+        metrics.record_api_call(success=False)
+        metrics.record_network_error("price_fetch_failed")
+        return
+
+    # --------------------------------------------------
+    # 2. Existing position? (先处理平仓)
+    # --------------------------------------------------
+    existing_pos = ledger.get_open_position(symbol)
+
+    if existing_pos:
+        print(
+            f"[POSITION] {symbol} has open position: "
+            f"{existing_pos.side} qty={existing_pos.quantity}"
+        )
+
+        # 更新账本里的 current_price
+        ledger.update_position(symbol, real_price)
+
+        # 同步给风控
+        risk_manager.update_position(
+            symbol=symbol,
+            side=existing_pos.side,
+            quantity=existing_pos.quantity,
+            entry_price=existing_pos.entry_price,
+            current_price=real_price,
+            leverage=existing_pos.leverage,
+            margin_type=existing_pos.margin_type,
+            stop_loss_price=existing_pos.stop_loss_price,
+            take_profit_price=existing_pos.take_profit_price,
+        )
+
+        # 判断是否需要平仓
+        should_close, reason, close_params = risk_manager.check_stop_conditions(
+            symbol, real_price
+        )
+
+        if should_close:
+            print(f"[EXIT SIGNAL] {symbol} reason={reason}")
+
+            # ===== 纸盘平仓 =====
+            if TRADING_MODE == "paper":
+                print(
+                    f"[PAPER CLOSE-REASON] {symbol} "
+                    f"reason={reason} entry={existing_pos.entry_price} exit={real_price}"
+                )
+
+                if existing_pos.side == "LONG":
+                    realized_pnl = (
+                        real_price - existing_pos.entry_price
+                    ) * existing_pos.quantity
+                else:
+                    realized_pnl = (
+                        existing_pos.entry_price - real_price
+                    ) * existing_pos.quantity
+
+                closed_pos = ledger.close_position(
+                    symbol,
+                    real_price,
+                    realized_pnl=realized_pnl,
+                )
+
+                if closed_pos:
+                    trade = Trade(
+                        trade_id="",
+                        symbol=symbol,
+                        side=closed_pos.side,
+                        entry_quantity=closed_pos.quantity,
+                        entry_price=closed_pos.entry_price,
+                        entry_timestamp=closed_pos.opened_at,
+                        entry_order_id=closed_pos.open_order_id,
+                        exit_quantity=closed_pos.quantity,
+                        exit_price=real_price,
+                        exit_timestamp=time.time(),
+                        exit_reason=reason,
+                        gross_pnl=realized_pnl,
+                        commission_total=0.0,
+                        net_pnl=realized_pnl,
+                        leverage=closed_pos.leverage,
+                        run_id=ledger.run_id,
+                        bot_profile=BOT_PROFILE_NAME,
+                    )
+                    ledger.record_trade(trade)
+                    metrics.record_position_closed(realized_pnl)
+
+                    alerts.send_alert(
+                        AlertLevel.INFO,
+                        f"[纸上平仓] {symbol}",
+                        (
+                            f"平仓原因：{reason}\n"
+                            f"开仓价：{existing_pos.entry_price}\n"
+                            f"平仓价：{real_price}\n"
+                            f"本次盈亏：{realized_pnl:.2f} USDT"
+                        ),
+                    )
+
+                    # 发送平仓通知
+                    reason_cn = {
+                        "stop_loss": "止损",
+                        "take_profit": "止盈",
+                        "trailing_stop": "追踪止损",
+                        "timeout": "超时",
+                    }.get(str(reason), str(reason))
+                    
+                    alerts.alert_position_closed(
+                        symbol=symbol,
+                        side=existing_pos.side,
+                        entry_price=existing_pos.entry_price,
+                        exit_price=real_price,
+                        pnl_usdt=realized_pnl,
+                        reason=reason_cn,
+                        trading_mode=TRADING_MODE,
+                    )
+
+                risk_manager.close_position(symbol, real_price, realized_pnl, now_ts)
+
+                # Cooldown marker (exit)
+                LAST_EXIT_UTC = now_ts
+
+            # ===== 真盘 / 测试网平仓 =====
+            elif ENABLE_REAL_TRADING:
+                try:
+                    result = adapter.close_position(symbol)
+                    if result:
+                        if existing_pos.side == "LONG":
+                            realized_pnl = (
+                                real_price - existing_pos.entry_price
+                            ) * existing_pos.quantity
+                        else:
+                            realized_pnl = (
+                                existing_pos.entry_price - real_price
+                            ) * existing_pos.quantity
+
+                        closed_pos = ledger.close_position(
+                            symbol,
+                            real_price,
+                            realized_pnl=realized_pnl,
+                        )
+
+                        if closed_pos:
+                            trade = Trade(
+                                trade_id="",
+                                symbol=symbol,
+                                side=closed_pos.side,
+                                entry_quantity=closed_pos.quantity,
+                                entry_price=closed_pos.entry_price,
+                                entry_timestamp=closed_pos.opened_at,
+                                entry_order_id=closed_pos.open_order_id,
+                                exit_quantity=closed_pos.quantity,
+                                exit_price=real_price,
+                                exit_timestamp=time.time(),
+                                exit_reason=reason,
+                                gross_pnl=realized_pnl,
+                                commission_total=0.0,
+                                net_pnl=realized_pnl,
+                                leverage=closed_pos.leverage,
+                                run_id=ledger.run_id,
+                            )
+                            ledger.record_trade(trade)
+                            metrics.record_position_closed(realized_pnl)
+
+                        risk_manager.close_position(
+                            symbol, real_price, realized_pnl, now_ts
+                        )
+
+                        # Cooldown marker (exit)
+                        LAST_EXIT_UTC = now_ts
+
+                        reason_cn = {
+                            "stop_loss": "止损",
+                            "take_profit": "止盈",
+                            "trailing_stop": "追踪止损",
+                            "timeout": "超时",
+                        }.get(str(reason), str(reason))
+
+                        alerts.send_alert(
+                            AlertLevel.INFO,
+                            f"[平仓] {symbol}",
+                            (
+                                f"原因：{reason_cn}\n"
+                                f"方向：{existing_pos.side}\n"
+                                f"开仓价：{existing_pos.entry_price}\n"
+                                f"平仓价：{real_price}\n"
+                                f"本次盈亏：{realized_pnl:.2f} USDT"
+                            ),
+                        )
+
+                        # 发送平仓通知
+                        alerts.alert_position_closed(
+                            symbol=symbol,
+                            side=existing_pos.side,
+                            entry_price=existing_pos.entry_price,
+                            exit_price=real_price,
+                            pnl_usdt=realized_pnl,
+                            reason=reason_cn,
+                            trading_mode=TRADING_MODE,
+                        )
+
+                        print(f"✅ 已平仓：{symbol}（{reason_cn}，PnL={realized_pnl:.2f} USDT）")
+
+                        if reason == "stop_loss":
+                            metrics.record_stop_loss()
+                        elif reason == "take_profit":
+                            metrics.record_take_profit()
+                        elif reason == "trailing_stop":
+                            metrics.record_trailing_stop()
+
+                except Exception as e:
+                    print(f"[CLOSE ERROR] {symbol}: {e}")
+                    alerts.alert_order_failed(symbol, f"Close error: {e}")
+                    metrics.record_api_call(success=False)
+
+        print("✅ run_once_for_symbol finished (position exists)")
+        return
+
+    # ---------------------------------------------
+    # 3. No existing position - check if we can open new
+    # ---------------------------------------------
+    if not can_open_new:
+        # 这里的 can_open_new 是主循环总闸：
+        # can_open_new = (recon_mode == NORMAL) and (not in_warmup)
+        # 所以被挡住可能是 warmup，也可能是对账进入 CLOSE_ONLY / EMERGENCY_STOP
+        try:
+            warmup_hint = ""
+            if "in_warmup" in locals() and locals()["in_warmup"]:
+                warmup_hint = "（冷静期 WARMUP 中）"
+            print(f"[BLOCKED] 禁止开新仓 {warmup_hint}：等待放行（对账模式或冷静期未结束）")
+        except Exception:
+            print("[BLOCKED] 禁止开新仓：等待放行（对账模式或冷静期未结束）")
+        return
+
+    # --------------------------------------------------
+    # 4. Fetch features (优先用预取，其次 OKX)
+    # --------------------------------------------------
+    try:
+        if prefetch and prefetch.get("features"):
+            features = prefetch["features"]
+        else:
+            features = fetch_okx_klines_and_features(symbol, INTERVAL)
+        metrics.record_api_call(success=True)
+    except Exception as e:
+        print(f"[FEATURES ERROR] {symbol}: {e}")
+        metrics.record_api_call(success=False)
+        return
+
+    # --------------------------------------------------
+    # 5. Decide action
+    # --------------------------------------------------
+    # IMPORTANT: The execution bot should NOT "看世界".
+    # If Intel output is provided (prefetch.intel_*), we MUST follow it and only validate/execute.
+    intel_action = None
+    intel_conf = None
+    intel_reason = None
+    if prefetch:
+        intel_action = prefetch.get("intel_action")
+        intel_conf = prefetch.get("intel_confidence")
+        intel_reason = prefetch.get("intel_reason")
+
+    if intel_action in ("LONG", "SHORT", "HOLD"):
+        action = str(intel_action)
+        try:
+            confidence = float(intel_conf or 0.0)
+        except Exception:
+            confidence = 0.0
+        print(f"[INTEL] {symbol} action={action} confidence={confidence:.3f} reason={intel_reason}")
+    else:
+        # Backward-compatible fallback (legacy rule-based decision)
+        action, confidence = decide_action(features)
+        print(f"[DECISION] {symbol} action={action} confidence={confidence:.3f}")
+
+    if action == "HOLD":
+        print("✅ run_once_for_symbol finished (HOLD)")
+        return
+
+    # --------------------------------------------------
+    # 5.5 EdgeGate v2 - PROBE Position Mechanism
+   # Calculate net_edge using the old gate for consistency (direction-aware)
+    pc = float(features.get("price_change", 0.0))
+
+    # LONG: pc>0 is favorable; SHORT: pc<0 is favorable
+    direction = 1.0 if action == "LONG" else -1.0
+    predicted_edge_pct = float(confidence) * (pc * direction)
+
+    print(
+        f"[EDGE_INPUT] {symbol} action={action} conf={confidence:.3f} "
+        f"price_change={pc:.6f} dir={direction:+.0f} predicted_edge_pct={predicted_edge_pct:.6f}"
+    )
+
+    # ------------------------------
+    # Cost Model: dynamic fee/slippage estimate from orderbook (works even with 0 fills)
+    # ------------------------------
+    fee_estimate_pct: float = EDGE_GATE_FIXED_FEE_PCT
+    cost_breakdown: Optional[Dict[str, Any]] = None
+    if COST_MODEL_ENABLED and _COST_MODEL_AVAILABLE and hasattr(adapter, 'fetch_order_book'):
+        try:
+            depth = adapter.fetch_order_book(symbol, limit=COST_DEPTH_LIMIT)
+            ob_snap = _depth_to_orderbook_snap(depth)
+            cost_in = CostInput(
+                symbol=symbol,
+                side=action,
+                notional_usd=float(AMOUNT_USDT),
+                order_type='MARKET',
+                expected_taker_ratio=float(EXPECTED_TAKER_RATIO),
+                leverage=float(MAX_LEVERAGE),
+                timestamp_ms=int(time.time() * 1000),
+            )
+            cost_snap = estimate_cost_from_orderbook(
+                cost_in=cost_in,
+                ob=ob_snap,
+                maker_fee_rate=float(MAKER_FEE_RATE),
+                taker_fee_rate=float(TAKER_FEE_RATE),
+                funding_bps_expected=0.0,
+            )
+            fee_estimate_pct = float(cost_snap.breakdown.total_cost_pct_roundtrip)
+            cost_breakdown = {
+                'mid': cost_snap.breakdown.mid_price,
+                'half_spread_bps': cost_snap.breakdown.half_spread_bps,
+                'impact_bps': cost_snap.breakdown.impact_bps,
+                'fee_bps_roundtrip': cost_snap.breakdown.fee_bps_roundtrip,
+                'total_cost_bps_roundtrip': cost_snap.breakdown.total_cost_bps_roundtrip,
+                'insufficient_depth': bool(cost_snap.meta.get('insufficient_depth')),
+            }
+            try:
+                append_cost_log_jsonl(COST_LOG_PATH, cost_snap)
+            except Exception:
+                pass
+            print(f'[COST] {symbol} est_total_cost_pct={fee_estimate_pct:.6f} breakdown={cost_breakdown}')
+        except Exception as e:
+            print(f'[COST WARN] {symbol} cost_model_failed -> fallback EDGE_GATE_FIXED_FEE_PCT={EDGE_GATE_FIXED_FEE_PCT}: {e}')
+            fee_estimate_pct = EDGE_GATE_FIXED_FEE_PCT
+            cost_breakdown = None
+
+    # Keep gate_v1 dict for downstream compatibility
+    gate_v1 = {
+        'gross_edge_pct': predicted_edge_pct,
+        'fee_estimate_pct': fee_estimate_pct,
+        'net_expected_edge': float(predicted_edge_pct) - float(fee_estimate_pct),
+    }
+    if cost_breakdown is not None:
+        gate_v1['cost_breakdown'] = cost_breakdown
+
+    net_edge = float(gate_v1['net_expected_edge'])
+
+    # If net_edge is non-positive:
+    # - Default: BLOCK
+    # - Optional: allow small negative band to pass as PROBE (small size) for exploration
+    ALLOW_NEG_EDGE_PROBE = os.getenv("ALLOW_NEG_EDGE_PROBE", "true").lower() == "true"
+    NEG_EDGE_PROBE = float(os.getenv("NEG_EDGE_PROBE", "-0.0002"))
+    probe_mult = float(os.getenv("EDGE_GATE_V2_PROBE_MULTIPLIER", "0.10"))
+
+    edge_percentile: Optional[float] = None
+
+    if net_edge <= 0:
+        # NOTE: even in PROBE mode, we do not pretend it is a positive edge.
+        edge_percentile = 0.0
+
+        if ALLOW_NEG_EDGE_PROBE and net_edge >= NEG_EDGE_PROBE:
+            print(
+                f"[EDGEGATE] net_edge_non_positive={net_edge:.6f} but within probe band "
+                f"(>= {NEG_EDGE_PROBE:.6f}); entering PROBE mode ({probe_mult:.2f}x) for symbol={symbol}"
+            )
+
+            class _ProbeResult:
+                def __init__(self):
+                    self.state = "PROBE"
+                    self.reason = "neg_edge_probe_allowed"
+                    self.position_multiplier = probe_mult
+
+            gate_v2_result = _ProbeResult()
+
+        else:
+            print(
+                f"[EDGEGATE] net_edge_non_positive={net_edge:.6f}, blocking symbol={symbol} "
+                f"(no PROBE; threshold={NEG_EDGE_PROBE:.6f}, enabled={ALLOW_NEG_EDGE_PROBE})"
+            )
+
+            class _BlockResult:
+                def __init__(self):
+                    self.state = "BLOCK"
+                    self.reason = "net_edge_non_positive"
+                    self.position_multiplier = 0.0
+
+            gate_v2_result = _BlockResult()
+
+    else:
+        # Calculate edge_percentile from historical data (symbol/direction/timeframe specific)
+        edge_percentile = edge_stats.get_edge_percentile(
+            net_edge=net_edge,
+            symbol=symbol,
+            direction=action,  # "LONG" or "SHORT"
+            timeframe=INTERVAL,  # e.g., "15m"
+        )
+
+        # Handle insufficient samples case
+        if edge_percentile is None:
+            print(
+                f"[EDGEGATE V2 WARN] {symbol} {action} - Insufficient samples for {INTERVAL}, "
+                f"forcing PROBE mode (0.10x) for conservative trial"
+            )
+            # Force conservative PROBE with minimum multiplier when no history
+            edge_percentile = EDGEGATE_V2_INSUFFICIENT_SAMPLES_PERCENTILE
+            gate_v2_result = edge_gate_v2.evaluate(
+                net_edge=max(net_edge, EDGEGATE_V2_INSUFFICIENT_SAMPLES_MIN_EDGE),
+                confidence=confidence,
+                edge_percentile=edge_percentile,
+            )
+            # Override to ensure PROBE small
+            if gate_v2_result.state != "BLOCK":
+                gate_v2_result.position_multiplier = 0.10
+                gate_v2_result.state = "PROBE"
+                gate_v2_result.reason = "insufficient_samples_probe_trial (samples < 20)"
+        else:
+            # Evaluate using EdgeGate v2 with valid percentile
+            fee_estimate_for_v2 = float(gate_v1.get("fee_estimate_pct", 0.0))
+            try:
+                gate_v2_result = edge_gate_v2.evaluate(
+                    net_edge=net_edge,
+                    confidence=confidence,
+                    edge_percentile=edge_percentile,
+                    fee_estimate=fee_estimate_for_v2,
+                )
+            except TypeError:
+                # Backward-compat: older EdgeGateV2.evaluate may not accept fee_estimate
+                gate_v2_result = edge_gate_v2.evaluate(
+                    net_edge=net_edge,
+                    confidence=confidence,
+                    edge_percentile=edge_percentile,
+                )
+
+    # Log decision for diagnostics
+    edge_diagnostics.record_decision(
+        state=gate_v2_result.state,
+        reason=gate_v2_result.reason,
+        net_edge=net_edge,
+        confidence=confidence,
+        edge_percentile=edge_percentile if edge_percentile is not None else 0.0,
+        position_multiplier=gate_v2_result.position_multiplier,
+        symbol=symbol,
+        timestamp=now_ts,
+    )
+
+    # Apply EdgeGate v2 decision
+    if gate_v2_result.state == "BLOCK":
+        print(
+            f"[EDGEGATE V2 BLOCK] {symbol} "
+            f"state={gate_v2_result.state} "
+            f"reason={gate_v2_result.reason} "
+            f"net_edge={net_edge:.6f} "
+            f"confidence={confidence:.3f} "
+            f"percentile={edge_percentile if edge_percentile is not None else 'N/A'}"
+        )
+        metrics.record_risk_block()
+        return
+
+    # Determine position size based on state
+    position_multiplier = gate_v2_result.position_multiplier
+    adjusted_amount_usdt = AMOUNT_USDT * position_multiplier
+    # --- PROBE min notional clamp (avoid qty rounding to 0) ---
+    probe_min_usdt = float(os.getenv("EDGE_GATE_V2_PROBE_MIN_USDT", "20"))
+    max_order_usdt = float(os.getenv("MAX_ORDER_USDT", str(AMOUNT_USDT)))  # 没有就按 AMOUNT_USDT
+    if gate_v2_result.state == "PROBE":
+        adjusted_amount_usdt = max(adjusted_amount_usdt, probe_min_usdt)
+    adjusted_amount_usdt = min(adjusted_amount_usdt, max_order_usdt)
+    print(
+        f"[EDGEGATE V2] {symbol} "
+        f"state={gate_v2_result.state} "
+        f"multiplier={position_multiplier:.2f} "
+        f"size={adjusted_amount_usdt:.2f} USDT "
+        f"reason={gate_v2_result.reason}"
+    )
+
+    # Record this edge for future percentile calculations
+    # CRITICAL: Record BEFORE trade outcome is known (no future function)
+    edge_stats.record_edge(
+        net_edge=net_edge,
+        symbol=symbol,
+        direction=action,  # "LONG" or "SHORT"
+        timeframe=INTERVAL,
+        signal_type=f"ml_{action.lower()}",
+        metadata={
+            "confidence": confidence,
+            "state": gate_v2_result.state,
+            "position_multiplier": position_multiplier,
+        },
+        timestamp=now_ts,
+    )
+
+    # --------------------------------------------------
+    # 6. Check quota
+    # --------------------------------------------------
+    remaining_quota = get_remaining_quota()
+    if remaining_quota <= 0:
+        print(f"[QUOTA BLOCK] {symbol} remaining={remaining_quota}")
+        alerts.send_alert(
+            AlertLevel.WARNING,
+            "当日下单额度已用完",
+            f"{symbol}：当日下单额度已用完，已停止新开仓。",
+        )
+        metrics.record_risk_block()
+        return
+
+    # --------------------------------------------------
+    # 7. Kill switch
+    # --------------------------------------------------
+    if KILL_SWITCH:
+        print(f"[KILL SWITCH] {symbol} blocked")
+        return
+
+    # --------------------------------------------------
+    # 8. Get account balance
+    # --------------------------------------------------
+    if TRADING_MODE == "paper":
+        account_balance = 10000.0
+    else:
+        try:
+            account = adapter.get_account_balance()
+            account_balance = float(account.get("totalWalletBalance", 10000.0))
+            metrics.record_api_call(success=True)
+        except Exception:
+            account_balance = 10000.0
+            metrics.record_api_call(success=False)
+            
+    # 用当前 real_price 作为风控计算 TP/SL 的入场参考价（paper/live 都可用）
+    entry_price_local = real_price
+
+    # --------------------------------------------------
+    # 9. Risk check (using adjusted position size from EdgeGate v2)
+    # --------------------------------------------------
+
+    # DEBUG: ensure the size we pass to risk_manager is exactly adjusted_amount_usdt
+    print(f"[SIZE CONSISTENCY] symbol={symbol} action={action} adjusted_amount_usdt={adjusted_amount_usdt} AMOUNT_USDT={AMOUNT_USDT} max_order_usdt={max_order_usdt}")
+
+    can_open, reason, adjusted_params = risk_manager.check_can_open_position(
+        symbol=symbol,
+        side=action,
+        size_usd=adjusted_amount_usdt,
+        account_balance=account_balance,
+        leverage=MAX_LEVERAGE,
+        
+        current_time=now_ts,
+    )
+
+
+    if not can_open:
+        print(f"[RISK BLOCK] {symbol} reason={reason}")
+        metrics.record_risk_block()
+        return
+
+    # ------------------------------
+    # TP/SL fallback safety (确保在真正下单前不会出现 None 的 SL/TP)
+    # 插入位置：在 adjusted_params 已计算并且 can_open 为 True 后，执行下单逻辑之前
+    # ------------------------------
+    try:
+        # 确保 adjusted_params 为字典
+        if adjusted_params is None:
+            adjusted_params = {}
+
+        # 读取可能的 TP/SL 与百分比配置
+        sl = adjusted_params.get("stop_loss_price")
+        tp = adjusted_params.get("take_profit_price")
+
+        # 优先使用 adjusted_params 中的 pct，如果没有则尝试环境变量名（兼容旧配置），否则默认 1%
+        sl_pct = adjusted_params.get("stop_loss_pct", os.getenv("STOP_LOSS_PCT", None))
+        tp_pct = adjusted_params.get("take_profit_pct", os.getenv("TAKE_PROFIT_PCT", None))
+
+        # Use entry_price_local as the reference entry price
+        entry_price_for_calc = None
+        try:
+            entry_price_for_calc = float(entry_price_local) if entry_price_local is not None else None
+        except Exception:
+            entry_price_for_calc = None
+
+        # Determine side (LONG / SHORT)
+        side_for_calc = (action or "").upper()
+
+        if entry_price_for_calc is not None and (sl is None or tp is None):
+            try:
+                sl_pct = float(sl_pct) if sl_pct is not None else 0.01
+            except Exception:
+                sl_pct = 0.01
+            try:
+                tp_pct = float(tp_pct) if tp_pct is not None else 0.01
+            except Exception:
+                tp_pct = 0.01
+
+            if side_for_calc == "LONG":
+                sl_calc = entry_price_for_calc * (1 - sl_pct)
+                tp_calc = entry_price_for_calc * (1 + tp_pct)
+            elif side_for_calc == "SHORT":
+                sl_calc = entry_price_for_calc * (1 + sl_pct)
+                tp_calc = entry_price_for_calc * (1 - tp_pct)
+            else:
+                # 无 side 信息，默认使用 LONG 方向的兜底（可调整）
+                sl_calc = entry_price_for_calc * (1 - sl_pct)
+                tp_calc = entry_price_for_calc * (1 + tp_pct)
+
+            if sl is None:
+                adjusted_params["stop_loss_price"] = sl_calc
+            if tp is None:
+                adjusted_params["take_profit_price"] = tp_calc
+
+            # DEBUG 日志，便于回归测试核对
+            try:
+                print(
+                    f"[TP/SL Fallback] symbol={symbol} side={side_for_calc} entry={entry_price_for_calc} "
+                    f"sl={adjusted_params.get('stop_loss_price')} tp={adjusted_params.get('take_profit_price')} "
+                    f"(sl_pct={sl_pct} tp_pct={tp_pct})"
+                )
+            except Exception:
+                pass
+    except Exception:
+        try:
+            import logging as _logging
+            _logging.getLogger(__name__).exception("TP/SL fallback failed")
+        except Exception:
+            pass
+
+    # --------------------------------------------------
+    # 10. Execute order (with EdgeGate v2 position sizing)
+    # --------------------------------------------------
+    if TRADING_MODE == "paper":
+        # ---------- Paper mode ----------
+        entry_price_local = real_price
+        print(
+            f"[PAPER ORDER] {symbol} {action} "
+            f"size_usd={adjusted_amount_usdt:.2f} (base={AMOUNT_USDT}, mult={position_multiplier:.2f}) "
+            f"price={entry_price_local}"
+        )
+
+        quantity = adjusted_amount_usdt / entry_price_local
+        stop_loss = adjusted_params.get("stop_loss_price") if adjusted_params else None
+        take_profit = adjusted_params.get("take_profit_price") if adjusted_params else None
+
+        print(
+            f"[DEBUG adjusted_params RAW] symbol={symbol} side={action} entry={entry_price_local} "
+            f"STOP_LOSS_PCT_ENV={os.getenv('STOP_LOSS_PCT')} TAKE_PROFIT_PCT_ENV={os.getenv('TAKE_PROFIT_PCT')} "
+            f"adjusted_params={adjusted_params!r}"
+        )
+
+        # --- FATAL sanity guard: block insane TP/SL levels (paper debugging safety) ---
+        if (stop_loss is not None and not _tpsl_dev_ok(entry_price_local, stop_loss, max_dev=0.20)) or (
+            take_profit is not None and not _tpsl_dev_ok(entry_price_local, take_profit, max_dev=0.20)
+        ):
+            print(
+                f"[FATAL TP/SL] symbol={symbol} side={action} entry={entry_price_local} "
+                f"sl={stop_loss} tp={take_profit} adjusted_params={adjusted_params!r}"
+            )
+            metrics.record_risk_block()
+            return
+
+        # Optional: print actual dev (helps acceptance test)
+        try:
+            if stop_loss is not None and entry_price_local:
+                sl_dev = abs(stop_loss / entry_price_local - 1.0)
+            else:
+                sl_dev = None
+            if take_profit is not None and entry_price_local:
+                tp_dev = abs(take_profit / entry_price_local - 1.0)
+            else:
+                tp_dev = None
+            print(f"[DEBUG TP/SL DEV] sl={stop_loss} dev_sl={sl_dev} tp={take_profit} dev_tp={tp_dev}")
+        except Exception as _e:
+            pass
+
+        # Apply stricter stop loss for PROBE positions
+        if gate_v2_result.state == "PROBE" and stop_loss is not None:
+            # Tighten stop loss by 30% for PROBE positions
+            if action == "LONG":
+                stop_loss_distance = entry_price_local - stop_loss
+                stop_loss = entry_price_local - (stop_loss_distance * 0.7)
+            else:  # SHORT
+                stop_loss_distance = stop_loss - entry_price_local
+                stop_loss = entry_price_local + (stop_loss_distance * 0.7)
+            print(f"[PROBE RISK] Tightened stop loss to {stop_loss} for PROBE position")
+
+        position = Position(
+            position_id="",
+            symbol=symbol,
+            side=action,
+            quantity=quantity,
+            entry_price=entry_price_local,
+            current_price=entry_price_local,
+            leverage=MAX_LEVERAGE,
+            margin_type=MARGIN_TYPE,
+            stop_loss_price=stop_loss,
+            take_profit_price=take_profit,
+            run_id=ledger.run_id,
+        )
+
+        # Validate to avoid ghost positions before persisting
+        if not _validate_position_before_open(position):
+            msg = f"Rejected open position for {symbol}: invalid entry_price/quantity/symbol/side"
+            logger.error("[RUNNER] %s", msg)
+            try:
+                alerts.alert_order_failed(symbol, msg)
+            except Exception:
+                pass
+            return
+
+        ledger.open_position(position)
+
+        # Cooldown marker (entry)
+        LAST_ENTRY_UTC = now_ts
+
+        risk_manager.update_position(
+            symbol=symbol,
+            side=action,
+            quantity=quantity,
+            entry_price=entry_price_local,
+            current_price=entry_price_local,
+            leverage=MAX_LEVERAGE,
+            margin_type=MARGIN_TYPE,
+            stop_loss_price=stop_loss,
+            take_profit_price=take_profit,
+        )
+
+        remaining = dec_quota()
+
+        metrics.record_order_submitted()
+        metrics.record_order_filled()
+        metrics.record_position_opened()
+
+        alerts.send_alert(
+            AlertLevel.INFO,
+            f"[模拟开仓-{gate_v2_result.state}] {symbol}",
+            (
+                f"方向：{action}\n"
+                f"数量：{quantity:.4f}\n"
+                f"价格：{entry_price_local}\n"
+                f"名义金额：{adjusted_amount_usdt:.2f} USDT（基准={AMOUNT_USDT}, 倍数={position_multiplier:.2f}x）\n"
+                f"EdgeGate 状态：{gate_v2_result.state}\n"
+                f"原因：{gate_v2_result.reason}\n"
+                f"剩余下单额度：{remaining}"
+            ),
+        )
+
+        print(f"✅ Paper order placed: {symbol} {action}")
+
+    elif ENABLE_REAL_TRADING:
+        # ---------- Real / testnet mode ----------
+        try:
+            try:
+                adapter.set_leverage(symbol, MAX_LEVERAGE)
+                adapter.set_margin_type(symbol, MARGIN_TYPE)
+                metrics.record_api_call(success=True)
+            except Exception as e:
+                print(f"[SETUP WARN] {symbol}: {e}")
+
+            quantity_est = AMOUNT_USDT / real_price
+
+            stop_loss = adjusted_params.get("stop_loss_price") if adjusted_params else None
+            take_profit = adjusted_params.get("take_profit_price") if adjusted_params else None
+
+            side = "BUY" if action == "LONG" else "SELL"
+
+            # ---- Real order sizing (Futures does NOT support quoteOrderQty reliably) ----
+            # Use EdgeGate-adjusted notional (adjusted_amount_usdt) and round quantity to stepSize.
+            notional_usdt = float(adjusted_amount_usdt)
+            side = "BUY" if action == "LONG" else "SELL"
+
+            # Hedge vs One-way:
+            # - Hedge (dualSidePosition=True): MUST send positionSide=LONG/SHORT
+            # - One-way: MUST NOT send positionSide
+            position_side = None
+            try:
+                dual = bool(adapter.is_dual_side_enabled(force_refresh=True))
+                if dual:
+                    position_side = "LONG" if action == "LONG" else "SHORT"
+            except Exception:
+                dual = False
+
+            # Quantity rounding to stepSize/minQty
+            qty_actual = None
+            entry_price_actual = float(real_price)
+            try:
+                filters = adapter.get_symbol_filters(symbol)
+                step = float(filters.get("stepSize") or 0.0)
+                min_qty = float(filters.get("minQty") or 0.0)
+            except Exception:
+                step = 0.0
+                min_qty = 0.0
+
+            raw_qty = notional_usdt / float(real_price) if float(real_price) > 0 else 0.0
+
+            def _floor_to_step(q: float, step: float) -> float:
+                if step <= 0:
+                    return q
+                n = int(q / step)
+                return n * step
+
+            qty = _floor_to_step(raw_qty, step)
+            # Basic safety: enforce minQty and avoid zero orders
+            if min_qty > 0 and qty < min_qty:
+                qty = min_qty
+            if qty <= 0:
+                raise RuntimeError(f"Computed qty<=0: raw_qty={raw_qty} step={step} minQty={min_qty}")
+
+            # Place order
+            result = adapter.place_market_order(
+                symbol=symbol,
+                side=side,
+                quantity=qty,
+                position_side=position_side,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+            )
+
+            # ---- ORDER_RESULT_CHECK: prevent ghost positions when adapter returns success=False ----
+            ok = True
+            err = None
+            order_id = None
+            try:
+                ok = bool(getattr(result, 'success', True))
+                err = getattr(result, 'error', None)
+                order_id = getattr(result, 'order_id', None)
+            except Exception:
+                # If result is a dict-like
+                try:
+                    ok = bool(result.get('success', True))
+                    err = result.get('error')
+                    order_id = result.get('order_id') or result.get('orderId')
+                except Exception:
+                    ok = True
+            if not ok:
+                msg = f"Order rejected by adapter: {err or 'unknown'}"
+                print(f"[ORDER REJECTED] {symbol}: {msg}")
+                try:
+                    alerts.alert_order_failed(symbol, msg)
+                except Exception:
+                    pass
+                metrics.record_order_submitted()
+                metrics.record_order_failed()
+                metrics.record_api_call(success=False)
+                return
+            else:
+                # Helpful trace: order id (if available)
+                if order_id is not None:
+                    print(f"[ORDER ACK] {symbol} order_id={order_id}")
+
+            entry_price_actual = float(_safe_extract(result, "avg_price", "avgPrice", default=real_price))
+            qty_actual = float(_safe_extract(result, "qty", "quantity", default=qty))
+
+            # Hardening: some MARKET responses can yield 0 avg_price/qty (or backfill can fail).
+            # In that case, fall back to computed qty and observed price to avoid a ghost-rejection.
+            if qty_actual <= 0:
+                qty_actual = float(qty)
+            if entry_price_actual <= 0:
+                entry_price_actual = float(real_price)
+            position = Position(
+                position_id="",
+                symbol=symbol,
+                side=action,
+                quantity=qty_actual,
+                entry_price=entry_price_actual,
+                current_price=entry_price_actual,
+                leverage=MAX_LEVERAGE,
+                margin_type=MARGIN_TYPE,
+                stop_loss_price=stop_loss,
+                take_profit_price=take_profit,
+                run_id=ledger.run_id,
+            )
+
+            # Validate to avoid ghost positions before persisting
+            if not _validate_position_before_open(position):
+                msg = f"Rejected real open position for {symbol}: invalid entry_price/quantity/symbol/side; entry_price={entry_price_actual} qty={qty_actual}"
+                logger.error("[RUNNER] %s", msg)
+                try:
+                    alerts.alert_order_failed(symbol, msg)
+                except Exception:
+                    pass
+                # If adapter already filled but we refuse to persist, we should consider alerting ops and reconciling.
+                # Do not call ledger.open_position in this invalid scenario.
+            else:
+                ledger.open_position(position)
+
+                # Cooldown marker (entry)
+                LAST_ENTRY_UTC = now_ts
+
+                risk_manager.update_position(
+                    symbol=symbol,
+                    side=action,
+                    quantity=qty_actual,
+                    entry_price=entry_price_actual,
+                    current_price=entry_price_actual,
+                    leverage=MAX_LEVERAGE,
+                    margin_type=MARGIN_TYPE,
+                    stop_loss_price=stop_loss,
+                    take_profit_price=take_profit,
+                )
+
+                remaining = dec_quota()
+
+                metrics.record_order_submitted()
+                metrics.record_order_filled()
+                metrics.record_position_opened()
+                metrics.record_api_call(success=True)
+
+                alerts.send_alert(
+                    AlertLevel.INFO,
+                    f"[OPEN] {symbol}",
+                    (
+                        f"Side: {action}\n"
+                        f"Qty: {qty_actual}\n"
+                        f"Price: {entry_price_actual}\n"
+                        f"Leverage: {MAX_LEVERAGE}x\n"
+                        f"Margin: {MARGIN_TYPE}\n"
+                        f"SL: {stop_loss}\n"
+                        f"TP: {take_profit}\n"
+                        f"Quota remaining: {remaining}"
+                    ),
+                )
+
+                print(f"✅ Order placed: {symbol} {action}")
+
+        except Exception as e:
+            print(f"[ORDER ERROR] {symbol}: {e}")
+            alerts.alert_order_failed(symbol, str(e))
+            metrics.record_order_submitted()
+            metrics.record_order_failed()
+            metrics.record_api_call(success=False)
+
+    print("✅ run_once_for_symbol finished")
+
+
+# ============================================
+# Main Initialization and Trading Loop
+# ============================================
+
+def main():
+    """Main trading loop"""
+    print(
+        """
+╔═══════════════════════════════════════════════════════════════╗
+║   Production Futures Trading Runner v4.0                      ║
+║   With Ledger | Reconciliation | Metrics | Alerts             ║
+╚═══════════════════════════════════════════════════════════════╝
+"""
+    )
+    # >>> 记录启动时间 <<<
+    startup_time = datetime.now(timezone.utc)
+    print("=" * 60)
+    print("Binance Futures Trading Runner V2")
+    print("=" * 60)
+    print(f"TRADING_MODE: {TRADING_MODE}")
+    print(f"FUTURES_MARKET_TYPE: {FUTURES_MARKET_TYPE}")
+    print(f"SYMBOLS: {SYMBOLS}")
+    print(f"INTERVAL: {INTERVAL}")
+    print(f"MAX_LEVERAGE: {MAX_LEVERAGE}x")
+    print(f"MARGIN_TYPE: {MARGIN_TYPE}")
+    print(f"ENABLE_REAL_TRADING: {ENABLE_REAL_TRADING}")
+    print(f"DAILY_ORDER_QUOTA: {DAILY_ORDER_QUOTA}")
+    print("=" * 60)
+
+    print("\n📊 Initializing systems...")
+    ledger = TradeLedger(base_dir="logs/ledger")
+    print(f"✅ Ledger initialized (run_id: {ledger.run_id})")
+
+    metrics = MetricsCollector(output_dir="logs/metrics")
+    print("✅ Metrics collector initialized")
+
+    alerts = AlertManager()
+    
+    # Ensure semantic alert helpers exist (compat layer)
+    try:
+        ensure_alert_manager_compat(alerts)
+    except Exception:
+        # Guard: never allow compat helper to raise
+        try:
+            import logging as _logging
+            _logging.getLogger(__name__).exception("ensure_alert_manager_compat failed")
+        except Exception:
+            pass
+
+    print("✅ Alert manager initialized")
+    # === 兼容层：确保实例上一定有 send_alert 方法 ===
+    try:
+        from types import MethodType
+    except ImportError:
+        MethodType = None  # 理论上不会发生
+
+    if not hasattr(alerts, "send_alert") and MethodType is not None:
+        def _send_alert(self, level, title, message, extra=None):
+            """
+            兼容旧接口：
+            - level 可能是 AlertLevel 枚举，也可能是字符串
+            - title / message 组合成一条纯文本
+            """
+            try:
+                level_name = getattr(level, "name", str(level)).upper()
+            except Exception:
+                level_name = str(level)
+            prefix = f"[{level_name}] {title}".strip()
+            text = prefix
+            if message:
+                text = f"{prefix}\n\n{message}"
+
+            # 简单映射到 info / warning / error
+            try:
+                if "ERROR" in level_name or "FATAL" in level_name:
+                    if hasattr(self, "error"):
+                        self.error(text)
+                        return
+                elif "WARN" in level_name:
+                    if hasattr(self, "warning"):
+                        self.warning(text)
+                        return
+                else:
+                    if hasattr(self, "info"):
+                        self.info(text)
+                        return
+            except Exception:
+                # If instance logging methods raise, fallback to module logger
+                import logging as _logging
+                _logging.getLogger(__name__).exception("Alert instance logging method raised")
+
+            import logging as _logging
+            _logging.getLogger(__name__).info(text)
+
+        alerts.send_alert = MethodType(_send_alert, alerts)
+        print("✅ AlertManager compatibility shim (send_alert) attached")
+    # IMPORTANT:
+    # Always pass ENABLE_REAL_TRADING into the adapter.
+    # If you don't, the adapter defaults to enable_real=False, which makes:
+    # - reconciliation see 0 exchange positions
+    # - the system enter CLOSE_ONLY / EMERGENCY_STOP
+    # - order placement silently disabled
+    if FUTURES_MARKET_TYPE == "UM":
+        adapter = BinanceUMFuturesAdapter(
+            trading_mode=TRADING_MODE,
+            enable_real=ENABLE_REAL_TRADING,
+        )
+    else:
+        adapter = BinanceCMFuturesAdapter(
+            trading_mode=TRADING_MODE,
+            enable_real=ENABLE_REAL_TRADING,
+        )
+    print(f"✅ {FUTURES_MARKET_TYPE} adapter initialized")
+
+    executor = OrderExecutor(adapter, ledger)
+    print("✅ Order executor initialized")
+
+    risk_manager = FuturesRiskManager()
+    print("✅ Risk manager initialized")
+
+    # Initialize EdgeGate v2 with PROBE position mechanism
+    edge_gate_v2 = create_default_edge_gate_v2()
+    print("✅ EdgeGate v2 initialized")
+
+    edge_stats = create_default_edge_stats()
+    print(f"✅ EdgeStats initialized ({edge_stats.get_statistics()['count']} historical records)")
+
+    edge_diagnostics = create_default_diagnostics()
+    print("✅ EdgeGate diagnostics initialized")
+
+    print("\n🔍 Performing state reconciliation...")
+    reconciliation = StateReconciliation(ledger, adapter)
+    recon_mode, recon_report = reconciliation.perform_reconciliation()
+
+    print(f"Reconciliation mode: {recon_mode}")
+    if recon_mode == ReconciliationMode.CLOSE_ONLY:
+        alerts.alert_reconciliation_failed(recon_report)
+        print("⚠️  System in CLOSE_ONLY mode - will only close positions")
+    elif recon_mode == ReconciliationMode.OPEN_WITH_RISK:
+        alerts.alert_reconciliation_failed(recon_report)
+        print("⚠️  Reconciliation inconsistent, but OPEN override enabled - entries allowed under additional risk constraints")
+    elif recon_mode == ReconciliationMode.EMERGENCY_STOP:
+        print("🚨 EMERGENCY STOP - cannot proceed")
+        alerts.send_alert(
+            AlertLevel.CRITICAL, "Emergency Stop", "Critical reconciliation failure"
+        )
+        sys.exit(1)
+
+    alerts.alert_system_startup(TRADING_MODE, ledger.run_id)
+
+    # Decision layer input (Intel/Strategy). The executor does not do market judging.
+    entry_authority = EntryAuthority()
+    # Auto-enable intel mode if shared TopN file is present (safe default for your setup)
+    try:
+        if os.path.exists(os.path.join('shared', 'topn.json')) and hasattr(entry_authority, 'use_intel'):
+            entry_authority.use_intel = True
+    except Exception:
+        pass
+
+
+    print("\n✅ All systems ready!")
+    print(f"📝 Ledger: {ledger.base_dir}")
+    print(f"📊 Metrics: {metrics.output_dir}")
+    print(f"🚀 Starting trading loop...\n")
+
+    batch_id = 0
+
+    try:
+        while True:
+            batch_id += 1
+            batch_now = datetime.now(timezone.utc)
+
+            # ------------------------------
+            # Decision layer intake (Intel) + execution universe
+            # Always include any open positions (local + exchange) so we can close/monitor them even if Intel is empty.
+            env_symbols = [s.upper() for s in SYMBOLS.copy()]
+
+            # Exchange open positions (source of truth)
+            exchange_open_syms = set()
+            if TRADING_MODE != "paper" and ENABLE_REAL_TRADING:
+                try:
+                    for p in adapter.get_positions() or []:
+                        sym = str(getattr(p, "symbol", "") or "").upper()
+                        if sym:
+                            exchange_open_syms.add(sym)
+                except Exception:
+                    pass
+
+            local_open_syms = set()
+            try:
+                for lp in ledger.get_all_open_positions() or []:
+                    sym = str(getattr(lp, "symbol", "") or "").upper()
+                    if sym:
+                        local_open_syms.add(sym)
+            except Exception:
+                pass
+
+            open_syms = set(exchange_open_syms) | set(local_open_syms)
+
+            # Intel signals (shared TopN + AI intel)
+            intel_signals: Dict[str, Any] = {}
+            intel_time_utc: Optional[float] = None  # epoch seconds (UTC)
+            intel_time_ok: bool = True
+            intel_global_hold: bool = False
+            intel_hold_reason: str = ""
+
+            if entry_authority.use_intel:
+                topn_path = os.environ.get("TOPN_PATH", os.path.join("shared", "topn.json"))
+                ai_path = os.environ.get("AI_INTEL_PATH", os.path.join("shared", "ai_intel.json"))
+
+                topn_symbols = None
+                topn_payload: Optional[Dict[str, Any]] = None
+                try:
+                    topn_symbols = load_topn_symbols(topn_path)
+                except Exception:
+                    topn_symbols = None
+
+                if not topn_symbols:
+                    try:
+                        with open(topn_path, "r", encoding="utf-8") as f:
+                            topn_payload = json.load(f)
+                        topn_symbols = topn_payload.get("symbols") or [
+                            x.get("symbol")
+                            for x in (topn_payload.get("topn") or [])
+                            if isinstance(x, dict) and x.get("symbol")
+                        ]
+                    except Exception:
+                        topn_payload = None
+                        topn_symbols = None
+
+                ai_intel: Optional[Dict[str, Any]] = None
+                try:
+                    ai_intel = load_ai_intel(ai_path)
+                except Exception:
+                    ai_intel = None
+
+                # Seed universe from TopN list
+                if topn_symbols:
+                    for s in topn_symbols:
+                        if not s:
+                            continue
+                        sym = str(s).upper().strip()
+                        intel_signals[sym] = {
+                            "action": "HOLD",
+                            "confidence": 0.0,
+                            "reason": "topn_candidate",
+                        }
+
+                # Overlay AI bias/confidence if present
+                if isinstance(ai_intel, dict):
+                    intel_global_hold = bool(ai_intel.get("risk_off", False))
+                    if intel_global_hold:
+                        intel_hold_reason = "ai_intel:risk_off"
+
+                    for c in (ai_intel.get("top_candidates") or []):
+                        if not isinstance(c, dict):
+                            continue
+                        sym = str(c.get("symbol", "")).upper().strip()
+                        if not sym:
+                            continue
+                        bias = str(c.get("bias", "HOLD")).upper().strip()
+
+                        action = "HOLD"
+                        if bias in ("LONG", "BUY"):
+                            action = "LONG"
+                        elif bias in ("SHORT", "SELL"):
+                            action = "SHORT"
+
+                        try:
+                            conf = float(c.get("confidence", 0.0) or 0.0)
+                        except Exception:
+                            conf = 0.0
+
+                        intel_signals[sym] = {
+                            "action": action,
+                            "confidence": conf,
+                            "reason": c.get("notes", "") or "ai_intel",
+                        }
+
+                # Timestamp / staleness guard
+                # IMPORTANT: Do NOT trust payload ts as the sole freshness signal.
+                # Some producers write local wall-clock into ts but tag it as UTC (exactly +8h drift).
+                # We therefore use the topn.json file mtime as the primary freshness source.
+
+                hold_minutes = 60
+                try:
+                    if isinstance(topn_payload, dict) and topn_payload.get("hold_minutes") is not None:
+                        hold_minutes = int(topn_payload.get("hold_minutes") or 60)
+                except Exception:
+                    hold_minutes = 60
+
+                # Prefer file mtime for freshness
+                intel_ts_payload: Optional[float] = None
+                if isinstance(topn_payload, dict) and isinstance(topn_payload.get("ts"), (int, float)):
+                    intel_ts_payload = float(topn_payload["ts"])
+                elif (
+                    isinstance(ai_intel, dict)
+                    and isinstance(ai_intel.get("meta", {}).get("ts"), (int, float))
+                ):
+                    intel_ts_payload = float(ai_intel["meta"]["ts"])
+
+                intel_ts_file: Optional[float] = None
+                try:
+                    if os.path.exists(topn_path):
+                        intel_ts_file = float(os.path.getmtime(topn_path))
+                except Exception:
+                    intel_ts_file = None
+
+                # Expose a ts for logging (prefer file mtime, fallback to payload)
+                intel_time_utc = intel_ts_file if intel_ts_file is not None else intel_ts_payload
+
+                # Freshness window
+                try:
+                    max_age = int(os.environ.get("INTEL_MAX_AGE_SECONDS", hold_minutes * 60))
+                except Exception:
+                    max_age = hold_minutes * 60
+
+                if intel_ts_file is not None:
+                    age = float(batch_now.timestamp()) - float(intel_ts_file)
+                    intel_time_ok = (age >= -60) and (age <= max_age)
+                elif intel_ts_payload is not None:
+                    # Fallback: payload ts only when file mtime is unavailable
+                    age = float(batch_now.timestamp()) - float(intel_ts_payload)
+                    intel_time_ok = (age >= -60) and (age <= max_age)
+                else:
+                    intel_time_ok = False
+
+                print(f"[INTEL] loaded symbols={len(intel_signals)} time_ok={intel_time_ok} global_hold={intel_global_hold} ts={intel_time_utc} hold_minutes={hold_minutes} max_age={max_age}")
+                if not intel_time_ok:
+                    # Safer to ignore stale intel than to trade on it.
+                    intel_signals = {}
+            if entry_authority.use_intel and intel_global_hold:
+                print(f"[INTEL] GLOBAL_HOLD=true reason={intel_hold_reason}")
+
+            if entry_authority.use_intel and intel_signals:
+                # NOTE: `env_symbols` are strings; some EntryAuthority implementations expect
+                # objects with a `.symbol` attribute and will crash with:
+                #   AttributeError: 'str' object has no attribute 'symbol'
+                # Keep the logic local and purely string-based.
+                intel_universe = sorted(set(env_symbols) | {str(s).upper() for s in intel_signals.keys()})
+            elif entry_authority.use_intel and entry_authority.intel_symbols_strict:
+                intel_universe = []
+            else:
+                intel_universe = env_symbols
+
+            # Final execution universe: union(open positions, intel_universe)
+            symbols = []
+            seen = set()
+            for sym in list(open_syms) + list(intel_universe):
+                su = str(sym).upper()
+                if su and su not in seen:
+                    seen.add(su)
+                    symbols.append(su)
+
+            if BATCH_SHUFFLE_SYMBOLS:
+                random.shuffle(symbols)
+
+            print("\n" + "=" * 60)
+            print(f"BATCH {batch_id}")
+            print("=" * 60)
+            print(f"Time: {_fmt_ts(batch_now)}")
+            print(f"Symbols: {symbols}")
+            print(f"Remaining quota: {get_remaining_quota()}")
+
+            if batch_id > 0 and batch_id % 10 == 0:
+                metrics.save_snapshot()
+                print("\n" + metrics.get_summary())
+
+            # Determine if we can open new positions
+            elapsed_minutes = (batch_now - startup_time).total_seconds() / 60.0
+            in_warmup = elapsed_minutes < STARTUP_WARMUP_MINUTES
+
+            if in_warmup:
+                print(
+                    f"[WARMUP] Elapsed={elapsed_minutes:.1f}m "
+                    f"< {STARTUP_WARMUP_MINUTES}m, monitoring only, no new positions."
+                )
+
+            # ------------------------------
+            # Entry gating: Reconciliation + Warmup + Intel freshness + Cooldown + Max symbol kinds
+            # ------------------------------
+            # Always refer to the reconciliation object (it may expose OPEN_WITH_RISK when override is enabled).
+            recon_mode = getattr(reconciliation, "mode", recon_mode)
+            recon_allows_entry = bool(getattr(reconciliation, "can_open_new_positions", lambda: recon_mode == ReconciliationMode.NORMAL)())
+
+            # Cooldown checks (UTC)
+            cooldown_reasons = []
+            if COOLDOWN_AFTER_ENTRY_SECONDS > 0 and LAST_ENTRY_UTC is not None:
+                dt = (batch_now - LAST_ENTRY_UTC).total_seconds()
+                if dt < COOLDOWN_AFTER_ENTRY_SECONDS:
+                    cooldown_reasons.append(f"entry_cooldown {dt:.0f}s<{COOLDOWN_AFTER_ENTRY_SECONDS}s")
+            if COOLDOWN_AFTER_EXIT_SECONDS > 0 and LAST_EXIT_UTC is not None:
+                dt = (batch_now - LAST_EXIT_UTC).total_seconds()
+                if dt < COOLDOWN_AFTER_EXIT_SECONDS:
+                    cooldown_reasons.append(f"exit_cooldown {dt:.0f}s<{COOLDOWN_AFTER_EXIT_SECONDS}s")
+
+            # Max active symbols (kinds) constraint
+            max_symbol_block = len(open_syms) >= int(MAX_ACTIVE_SYMBOLS)
+
+            # Intel freshness gate (entries only)
+            intel_ok_for_entry = True
+            if entry_authority.use_intel:
+                intel_ok_for_entry = bool(intel_time_ok) and (not intel_global_hold)
+
+            can_open_new = (
+                recon_allows_entry
+                and (not in_warmup)
+                and (not KILL_SWITCH)
+                and intel_ok_for_entry
+                and (not max_symbol_block)
+                and (len(cooldown_reasons) == 0)
+            )
+
+            if not can_open_new:
+                reasons = []
+                if not recon_allows_entry:
+                    reasons.append(f"recon_mode={recon_mode}")
+                if in_warmup:
+                    reasons.append("warmup")
+                if KILL_SWITCH:
+                    reasons.append("kill_switch")
+                if entry_authority.use_intel and not intel_ok_for_entry:
+                    if intel_global_hold:
+                        reasons.append("global_hold")
+                    else:
+                        reasons.append("intel_stale")
+                if max_symbol_block:
+                    reasons.append(f"max_active_symbols {len(open_syms)}/{MAX_ACTIVE_SYMBOLS}")
+                reasons += cooldown_reasons
+                print(f"[ENTRY BLOCK] {' | '.join(reasons) if reasons else 'blocked'}")
+
+            prefetch_map: Dict[str, Dict[str, Any]] = {}
+
+            if BATCH_FETCH_CONCURRENT and len(symbols) > 1:
+                workers = max(1, min(BATCH_MAX_WORKERS, len(symbols)))
+                with ThreadPoolExecutor(max_workers=workers) as ex:
+                    future_map = {
+                        ex.submit(_prefetch_symbol_pack, s): s for s in symbols
+                    }
+                    for fut in as_completed(future_map):
+                        s = future_map[fut]
+                        try:
+                            prefetch_map[s] = fut.result()
+                        except Exception as e:
+                            prefetch_map[s] = {
+                                "symbol": s,
+                                "ok": False,
+                                "error": str(e),
+                            }
+            else:
+                for s in symbols:
+                    prefetch_map[s] = _prefetch_symbol_pack(s)
+
+            # Attach Intel decisions to prefetch pack (executor follows Intel, does not "看世界")
+            for s in symbols:
+                p = prefetch_map.get(s) if isinstance(prefetch_map.get(s), dict) else {}
+                if not isinstance(p, dict):
+                    p = {"symbol": s}
+
+                if entry_authority.use_intel:
+                    if intel_signals and intel_time_ok:
+                        ia, ic, ir = entry_authority.get_entry_instruction(s, intel_signals, batch_now)
+                    else:
+                        ia, ic, ir = "HOLD", 0.0, "intel_stale_or_empty"
+                    p["intel_action"] = ia
+                    p["intel_confidence"] = ic
+                    p["intel_reason"] = ir
+
+                prefetch_map[s] = p
+
+            for symbol in symbols:
+                try:
+                    run_once_for_symbol(
+                        symbol,
+                        ledger,
+                        adapter,
+                        risk_manager,
+                        alerts,
+                        metrics,
+                        edge_gate_v2,
+                        edge_stats,
+                        edge_diagnostics,
+                        now_ts=batch_now,
+                        prefetch=prefetch_map.get(symbol),
+                        batch_id=batch_id,
+                        can_open_new=can_open_new,
+                        in_warmup=in_warmup,
+                    )
+
+                except Exception as e:
+                    print(f"[ERROR] {symbol}: {e}")
+                    alerts.send_alert(
+                        AlertLevel.ERROR,
+                        f"交易错误：{symbol}",
+                        f"批次：{batch_id}\n{type(e).__name__}: {e}",
+                    )
+
+            sleep_sec = next_round_sleep_sec()
+            print(f"\n[BATCH] Finished {batch_id}. Next round in {sleep_sec}s")
+            time.sleep(sleep_sec)
+
+        # 正常退出循环（不会走到这里，除非手动break）
+        shutdown_reason = "正常退出"
+
+    except Exception as e:
+        # ⚠️ 系统异常（不一定是致命）
+        print(f"\n❌ 捕获异常: {type(e).__name__}: {e}")
+        shutdown_reason = f"异常退出: {type(e).__name__}"
+
+        # 🚑 告警是旁路系统，绝不能拖死主流程
+        try:
+            alerts.send_alert(
+            AlertLevel.ERROR,
+            "系统异常（已捕获）",
+            str(e),
+            )
+        except Exception as alert_err:
+            print(f"[ALERT WARN] 告警发送失败，已忽略: {alert_err}")
+
+    # ❗ 不 raise，让 finally 正常走完
+
+
+
+    finally:
+        # 🚨 唯一且最终的退出兜底（一定执行）
+        print("\n" + "=" * 60)
+        print("FINAL METRICS")
+        print("=" * 60)
+        print(metrics.get_summary())
+        metrics.save_snapshot()
+
+        # 统一系统关闭通知（防漏）
+        if 'shutdown_reason' in locals():
+            try:
+                alerts.alert_system_shutdown(shutdown_reason)
+                time.sleep(0.5)
+            except Exception as e:
+                print(f"[ALERT WARN] 关闭通知发送失败，忽略: {e}")
+
+        print("\n🚀 交易系统已关闭。")
+
+
+if __name__ == "__main__":
+    try:
+        print("🚀 futures_runner_v4 starting...")
+        main()
+    except KeyboardInterrupt:
+        print("\n🛑 用户中断（Ctrl+C）")
+    except Exception as e:
+        print(f"\n❌ 致命错误: {type(e).__name__}: {e}")
+        raise

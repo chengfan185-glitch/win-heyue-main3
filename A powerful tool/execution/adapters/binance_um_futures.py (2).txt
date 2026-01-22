@@ -1,0 +1,380 @@
+from __future__ import annotations
+
+"""
+Binance USDT-M Futures Adapter (robust signing + better time sync + retries)
+
+Fixes included:
+- Signature mismatch fix: sign EXACT query string order (no sorting).
+- Better time sync: RTT midpoint offset to reduce -1021.
+- Adds recvWindow to reduce timestamp sensitivity.
+- place_market_order accepts position_side (optional) and quote_quantity safely.
+- Retries on -1021 (timestamp) with force time resync; does NOT turn into -1022.
+"""
+
+import os
+import time
+import hmac
+import math
+import hashlib
+from dataclasses import dataclass
+from typing import Optional, Dict, Any
+from urllib.parse import urlencode
+
+import requests
+
+
+print("[LOADED] BinanceUMFuturesAdapter FROM:", __file__)
+
+
+@dataclass
+class OrderResult:
+    success: bool
+    order_id: Optional[str] = None
+    exchange_order_id: Optional[str] = None
+    qty: float = 0.0
+    avg_price: float = 0.0
+    error: Optional[str] = None
+
+
+@dataclass
+class PositionInfo:
+    symbol: str
+    position_amt: float
+    entry_price: float
+    position_side: str  # LONG / SHORT
+
+
+class BinanceUMFuturesAdapter:
+    BASE_URLS = {
+        "testnet": "https://testnet.binancefuture.com",
+        "live": "https://fapi.binance.com",
+    }
+
+    DEFAULT_TIME_SYNC_INTERVAL_MS = int(
+        os.getenv("BINANCE_TIME_SYNC_INTERVAL_MS", str(5 * 60 * 1000))
+    )  # 5 minutes
+
+    DEFAULT_RECV_WINDOW = int(os.getenv("BINANCE_RECV_WINDOW", "5000"))
+
+    def __init__(self, trading_mode: str = "paper", enable_real: Optional[bool] = None):
+        self.trading_mode = trading_mode
+
+        if enable_real is not None:
+            self.enable_real = enable_real
+        else:
+            self.enable_real = os.getenv("ENABLE_REAL_TRADING", "false").lower() == "true"
+
+        self.api_key = os.getenv("BINANCE_API_KEY", "").strip()
+        self.api_secret = os.getenv("BINANCE_API_SECRET", "").strip()
+
+        if self.trading_mode in ("testnet", "live"):
+            if not self.api_key or not self.api_secret:
+                raise RuntimeError("BINANCE_API_KEY / BINANCE_API_SECRET 未配置")
+
+        self.base_url = self.BASE_URLS.get(self.trading_mode)
+        if self.base_url is None and self.trading_mode != "paper":
+            raise RuntimeError(f"No base_url for trading_mode={self.trading_mode}")
+
+        self._session = requests.Session()
+        self._session.headers.update(
+            {
+                "User-Agent": "win-heyue/adapter",
+                "X-MBX-APIKEY": self.api_key,
+            }
+        )
+
+        self._time_offset_ms: Optional[int] = None
+        self._time_sync_at_ms: Optional[int] = None
+
+        try:
+            self._time_sync_interval_ms = int(
+                os.getenv("BINANCE_TIME_SYNC_INTERVAL_MS", str(self.DEFAULT_TIME_SYNC_INTERVAL_MS))
+            )
+        except Exception:
+            self._time_sync_interval_ms = self.DEFAULT_TIME_SYNC_INTERVAL_MS
+
+        masked_key = f"{self.api_key[:4]}...{self.api_key[-4:]}" if self.api_key else "<empty>"
+        print(
+            "[BinanceUMFuturesAdapter] "
+            f"trading_mode={self.trading_mode} enable_real={self.enable_real} "
+            f"base_url={self.base_url} api_key={masked_key}"
+        )
+
+    # ---------------- Time Sync ----------------
+
+    def _server_time_with_rtt(self) -> int:
+        """
+        Return estimated server time (ms), adjusted by RTT midpoint.
+        """
+        url = self.base_url + "/fapi/v1/time"
+        t0 = time.time()
+        r = self._session.get(url, timeout=5)
+        t1 = time.time()
+        r.raise_for_status()
+        data = r.json()
+        server_ms = int(data["serverTime"])
+        rtt_ms = int((t1 - t0) * 1000)
+        # approximate "server time when we received response" by adding half RTT
+        return server_ms + max(0, rtt_ms // 2)
+
+    def _sync_time(self, force: bool = False) -> None:
+        if self.trading_mode == "paper":
+            return
+
+        now_ms = int(time.time() * 1000)
+        if (not force) and (self._time_sync_at_ms is not None):
+            if now_ms - self._time_sync_at_ms < self._time_sync_interval_ms:
+                return
+
+        try:
+            est_server_ms = self._server_time_with_rtt()
+            local_ms = now_ms
+            self._time_offset_ms = int(est_server_ms - local_ms)
+            self._time_sync_at_ms = now_ms
+            print(f"[TIME_SYNC] offset={self._time_offset_ms}ms (est_server={est_server_ms} local={local_ms})")
+        except Exception as e:
+            print(f"[TIME_SYNC] failed: {e}")
+
+    def _ts(self) -> int:
+        now_ms = int(time.time() * 1000)
+        if self.trading_mode == "paper":
+            return now_ms
+
+        if self._time_offset_ms is None:
+            self._sync_time(force=True)
+
+        offset = int(self._time_offset_ms) if self._time_offset_ms is not None else 0
+        return now_ms + offset
+
+    # ---------------- Signing ----------------
+
+    def _sign_query_string(self, query_string: str) -> str:
+        return hmac.new(
+            self.api_secret.encode("utf-8"),
+            query_string.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+
+    def _build_signed_params(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Build params dict including timestamp/recvWindow/signature.
+        IMPORTANT: signature must be computed from the EXACT query string order
+        that will be sent; therefore we DO NOT sort items.
+        """
+        signed = dict(params)  # preserves insertion order from caller
+        signed["recvWindow"] = self.DEFAULT_RECV_WINDOW
+        signed["timestamp"] = int(self._ts())
+
+        # build query string in the same insertion order
+        qs = urlencode(signed, doseq=True)
+        signed["signature"] = self._sign_query_string(qs)
+        return signed
+
+    # ---------------- Request ----------------
+
+    def _request(self, method: str, path: str, params: Dict[str, Any], max_retries: int = 3):
+        if self.base_url is None:
+            raise RuntimeError("base_url is not set (invalid trading_mode?)")
+
+        if self.trading_mode != "paper":
+            self._sync_time()
+
+        attempt = 0
+        last_error = None
+
+        while attempt < max_retries:
+            attempt += 1
+            signed_params = self._build_signed_params(params)
+            url = self.base_url + path
+
+            try:
+                print(f"[BinanceUMFuturesAdapter] REQUEST {method} {url} attempt={attempt}")
+
+                r = self._session.request(
+                    method=method,
+                    url=url,
+                    params=signed_params,   # Binance accepts signed query string for GET/POST
+                    timeout=10,
+                )
+                r.raise_for_status()
+                return r.json()
+
+            except requests.HTTPError as http_err:
+                resp = http_err.response
+                body = ""
+                try:
+                    body = resp.text if resp is not None else ""
+                except Exception:
+                    body = "<unreadable>"
+
+                # parse Binance error
+                code = None
+                msg = ""
+                try:
+                    j = resp.json() if resp is not None else {}
+                    if isinstance(j, dict):
+                        code = j.get("code", None)
+                        msg = j.get("msg", "")
+                except Exception:
+                    pass
+
+                print(f"[BinanceUMFuturesAdapter] HTTPError status={getattr(resp,'status_code',None)} body={body}")
+
+                # Timestamp error: force resync and retry
+                if code == -1021 or ("Timestamp" in body) or ("timestamp" in msg):
+                    print("[BinanceUMFuturesAdapter] Timestamp error -> force resync and retry.")
+                    self._sync_time(force=True)
+                    last_error = http_err
+                    continue
+
+                # For 5xx retry
+                status = resp.status_code if resp is not None else None
+                if status is not None and 500 <= status < 600:
+                    backoff = min(8, int(math.pow(2, attempt)))
+                    time.sleep(backoff)
+                    last_error = http_err
+                    continue
+
+                raise
+
+            except (requests.Timeout, requests.ConnectionError) as e:
+                print(f"[BinanceUMFuturesAdapter] Network error: {e} attempt={attempt}")
+                last_error = e
+                backoff = min(8, int(math.pow(2, attempt)))
+                time.sleep(backoff)
+                # occasionally resync
+                if attempt == 1 and self.trading_mode != "paper":
+                    self._sync_time(force=True)
+                continue
+
+        raise RuntimeError(f"Request failed after retries: {last_error}")
+
+    # ---------------- Public APIs ----------------
+
+    def set_leverage(self, symbol: str, leverage: int) -> bool:
+        if self.trading_mode == "paper" or not self.enable_real:
+            print("[set_leverage] paper mode or real trading disabled - no-op")
+            return True
+        self._request("POST", "/fapi/v1/leverage", {"symbol": symbol, "leverage": leverage})
+        return True
+
+    def set_margin_type(self, symbol: str, margin_type: str) -> bool:
+        if self.trading_mode == "paper" or not self.enable_real:
+            print("[set_margin_type] paper mode or real trading disabled - no-op")
+            return True
+        try:
+            self._request("POST", "/fapi/v1/marginType", {"symbol": symbol, "marginType": margin_type})
+            return True
+        except Exception as e:
+            print(f"[set_margin_type] failed: {e}")
+            return False
+
+    def place_market_order(
+        self,
+        symbol: str,
+        side: str,  # "BUY"/"SELL"
+        quantity: Optional[float] = None,
+        quote_quantity: Optional[float] = None,
+        reduce_only: bool = False,
+        position_side: Optional[str] = None,  # "LONG"/"SHORT" (hedge mode only)
+    ) -> OrderResult:
+        if self.trading_mode == "paper":
+            return OrderResult(success=True, order_id=f"paper_{symbol}_{side}", qty=float(quantity or 0.0), avg_price=0.0)
+
+        if not self.enable_real:
+            return OrderResult(success=False, error="ENABLE_REAL_TRADING=false")
+
+        params: Dict[str, Any] = {
+            "symbol": symbol,
+            "side": side,
+            "type": "MARKET",
+            "reduceOnly": "true" if reduce_only else "false",
+        }
+
+        # Only include positionSide if explicitly requested (hedge mode)
+        if position_side is not None:
+            params["positionSide"] = position_side
+
+        if quantity is not None:
+            params["quantity"] = quantity
+        if quote_quantity is not None:
+            params["quoteOrderQty"] = quote_quantity
+
+        try:
+            res = self._request("POST", "/fapi/v1/order", params)
+            return OrderResult(
+                success=True,
+                order_id=str(res.get("orderId")),
+                exchange_order_id=str(res.get("orderId")),
+                qty=float(res.get("executedQty", 0) or 0),
+                avg_price=float(res.get("avgPrice", 0) or 0),
+            )
+        except Exception as e:
+            return OrderResult(success=False, error=str(e))
+
+    def get_positions(self):
+        if self.trading_mode == "paper" or not self.enable_real:
+            return []
+
+        try:
+            data = self._request("GET", "/fapi/v2/positionRisk", {})
+        except Exception as e:
+            print(f"[get_positions] request failed: {e}")
+            return []
+
+        out = []
+        for p in data:
+            try:
+                amt = float(p.get("positionAmt", 0))
+            except Exception:
+                amt = 0.0
+            if amt == 0:
+                continue
+
+            out.append(
+                PositionInfo(
+                    symbol=p["symbol"],
+                    position_amt=amt,
+                    entry_price=float(p.get("entryPrice", 0)),
+                    position_side="LONG" if amt > 0 else "SHORT",
+                )
+            )
+        return out
+
+    def get_position(self, symbol: Optional[str] = None):
+        return self.get_positions()
+
+    def close_position(self, symbol: str, position_amt: float = 0.0) -> bool:
+        if position_amt == 0:
+            try:
+                for p in self.get_positions():
+                    if p.symbol == symbol:
+                        position_amt = p.position_amt
+                        break
+            except Exception:
+                position_amt = 0
+
+        if position_amt == 0:
+            return True
+
+        side = "SELL" if position_amt > 0 else "BUY"
+        qty = abs(position_amt)
+
+        r = self.place_market_order(symbol=symbol, side=side, quantity=qty, reduce_only=True)
+        return r.success
+
+    def test_connection(self) -> bool:
+        if self.trading_mode == "paper" or not self.enable_real:
+            print("[test_connection] paper mode or real trading disabled - returning True")
+            return True
+
+        try:
+            url = self.base_url + "/fapi/v1/ping"
+            r = self._session.get(url, timeout=10)
+            print(f"[test_connection] status={r.status_code} text={r.text}")
+            r.raise_for_status()
+            self._sync_time(force=True)
+            return True
+        except Exception as e:
+            print(f"[test_connection] failed: {e}")
+            return False

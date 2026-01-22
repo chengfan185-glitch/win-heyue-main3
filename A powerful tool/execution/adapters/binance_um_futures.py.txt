@@ -1,0 +1,270 @@
+from __future__ import annotations
+"""
+Binance USDT-M Futures Adapter
+"""
+
+print("🔥 LOADED BinanceUMFuturesAdapter FROM:", __file__)
+
+import time
+import hmac
+import hashlib
+import requests
+import os
+from typing import Optional, Dict, Any, Literal, List
+from dataclasses import dataclass
+from urllib.parse import urlencode
+
+
+@dataclass
+class OrderResult:
+    success: bool
+    order_id: Optional[str] = None
+    exchange_order_id: Optional[str] = None
+    qty: float = 0.0
+    avg_price: float = 0.0
+    error: Optional[str] = None
+
+
+@dataclass
+class PositionInfo:
+    symbol: str
+    position_amt: float
+    entry_price: float
+    position_side: str  # LONG / SHORT
+
+
+class BinanceUMFuturesAdapter:
+    """
+    Binance USDT-M Futures Adapter
+    Supports paper / testnet / live
+    """
+
+    BASE_URLS = {
+        "testnet": "https://testnet.binancefuture.com",
+        "live": "https://fapi.binance.com",
+    }
+
+    def __init__(self, trading_mode: Literal["paper", "testnet", "live"] = "paper"):
+        self.trading_mode = trading_mode
+        # ENABLE_REAL_TRADING env var must be "true" (case-insensitive) to enable real requests
+        self.enable_real = os.getenv("ENABLE_REAL_TRADING", "false").lower() == "true"
+
+        self.api_key = os.getenv("BINANCE_API_KEY", "")
+        self.api_secret = os.getenv("BINANCE_API_SECRET", "")
+
+        if trading_mode in ("testnet", "live"):
+            if not self.api_key or not self.api_secret:
+                raise RuntimeError("BINANCE_API_KEY / BINANCE_API_SECRET 未配置")
+
+        self.base_url = self.BASE_URLS.get(trading_mode)
+
+        # Diagnostics: make sure base_url exists and print masked API key
+        masked_key = (self.api_key[:4] + "..." + self.api_key[-4:]) if self.api_key else "<empty>"
+        print(f"[BinanceUMFuturesAdapter] trading_mode={self.trading_mode} enable_real={self.enable_real} base_url={self.base_url} api_key={masked_key}")
+
+        if self.base_url is None and self.trading_mode != "paper":
+            raise RuntimeError(f"No base_url for trading_mode={self.trading_mode}")
+
+    # ---------- 内部工具 ----------
+
+    def _ts(self) -> int:
+        return int(time.time() * 1000)
+
+    def _sign(self, params: Dict[str, Any]) -> str:
+        qs = urlencode(params)
+        return hmac.new(
+            self.api_secret.encode(),
+            qs.encode(),
+            hashlib.sha256,
+        ).hexdigest()
+
+    def _headers(self) -> Dict[str, str]:
+        return {"X-MBX-APIKEY": self.api_key}
+
+    def _request(self, method: str, path: str, params: Dict[str, Any]):
+        """
+        Signs and sends a request. On HTTP errors we print response text to help debugging.
+        """
+        if self.base_url is None:
+            raise RuntimeError("base_url is not set (trading_mode maybe invalid)")
+
+        params = dict(params)  # copy to avoid side effects
+        params["timestamp"] = self._ts()
+        params["signature"] = self._sign(params)
+
+        full_url = self.base_url + path
+        try:
+            # Print debug info for transparency in runner logs
+            print(f"[BinanceUMFuturesAdapter] REQUEST {method} {full_url} params={params}")
+            r = requests.request(
+                method,
+                full_url,
+                params=params,
+                headers=self._headers(),
+                timeout=10,
+            )
+            # if status code not 2xx this will raise and we can print r.text
+            r.raise_for_status()
+            try:
+                return r.json()
+            except Exception:
+                # fall back to raw text if JSON parsing fails
+                print("[BinanceUMFuturesAdapter] WARNING: response not json, returning text")
+                return r.text
+        except requests.HTTPError as http_err:
+            # Try to show response content to help debug (Binance often returns JSON with error message)
+            resp_text = getattr(http_err.response, "text", "<no response text>")
+            print(f"[BinanceUMFuturesAdapter] HTTPError: {http_err} response_text={resp_text}")
+            raise
+        except Exception as e:
+            print(f"[BinanceUMFuturesAdapter] Request failed: {e}")
+            raise
+
+    # ---------- 配置 ----------
+
+    def set_leverage(self, symbol: str, leverage: int) -> bool:
+        if self.trading_mode == "paper" or not self.enable_real:
+            print("[set_leverage] paper mode or real trading disabled - no-op")
+            return True
+
+        self._request("POST", "/fapi/v1/leverage", {
+            "symbol": symbol,
+            "leverage": leverage,
+        })
+        return True
+
+    def set_margin_type(self, symbol: str, margin_type: str) -> bool:
+        if self.trading_mode == "paper" or not self.enable_real:
+            print("[set_margin_type] paper mode or real trading disabled - no-op")
+            return True
+
+        try:
+            self._request("POST", "/fapi/v1/marginType", {
+                "symbol": symbol,
+                "marginType": margin_type,
+            })
+        except Exception as e:
+            # don't silently swallow errors; print them
+            print(f"[set_margin_type] failed: {e}")
+            return False
+        return True
+
+    # ---------- 下单 ----------
+
+    def place_market_order(
+        self,
+        symbol: str,
+        side: str,
+        quantity: float,
+        reduce_only: bool = False,
+    ) -> OrderResult:
+
+        if self.trading_mode == "paper":
+            return OrderResult(
+                success=True,
+                order_id=f"paper_{symbol}_{side}",
+                qty=quantity,
+                avg_price=0.0,
+            )
+
+        if not self.enable_real:
+            return OrderResult(success=False, error="ENABLE_REAL_TRADING=false")
+
+        try:
+            res = self._request("POST", "/fapi/v1/order", {
+                "symbol": symbol,
+                "side": side,
+                "type": "MARKET",
+                "quantity": quantity,
+                "reduceOnly": "true" if reduce_only else "false",
+            })
+            return OrderResult(
+                success=True,
+                order_id=str(res.get("orderId")),
+                exchange_order_id=str(res.get("orderId")),
+                qty=float(res.get("executedQty", 0)),
+                avg_price=float(res.get("avgPrice", 0)),
+            )
+        except Exception as e:
+            return OrderResult(success=False, error=str(e))
+
+    # ---------- 平仓 ----------
+
+    def close_position(self, symbol: str, position_amt: float) -> bool:
+        if position_amt == 0:
+            return True
+
+        side = "SELL" if position_amt > 0 else "BUY"
+        qty = abs(position_amt)
+
+        r = self.place_market_order(
+            symbol=symbol,
+            side=side,
+            quantity=qty,
+            reduce_only=True,
+        )
+        return r.success
+
+    # ---------- 查询（关键接口，runner 依赖） ----------
+
+    def get_position(self, symbol: Optional[str] = None):
+        # runner 用这个名字
+        return self.get_positions()
+
+    def get_positions(self) -> List[PositionInfo]:
+        if self.trading_mode == "paper" or not self.enable_real:
+            print("[get_positions] paper mode or real trading disabled - returning []")
+            return []
+
+        try:
+            data = self._request("GET", "/fapi/v2/positionRisk", {})
+        except Exception as e:
+            print(f"[get_positions] request failed: {e}")
+            return []
+
+        out: List[PositionInfo] = []
+
+        for p in data:
+            try:
+                amt = float(p.get("positionAmt", 0))
+            except Exception:
+                amt = 0.0
+            if amt == 0:
+                continue
+
+            out.append(
+                PositionInfo(
+                    symbol=p["symbol"],
+                    position_amt=amt,
+                    entry_price=float(p.get("entryPrice", 0)),
+                    position_side="LONG" if amt > 0 else "SHORT",
+                )
+            )
+
+        return out
+
+    # ---------- Diagnostics helper ----------
+
+    def test_connection(self) -> bool:
+        """
+        Simple test to hit Binance ping endpoint (does not require auth).
+        Returns True if able to reach Binance; prints details on failure.
+        """
+        if self.trading_mode == "paper" or not self.enable_real:
+            print("[test_connection] paper mode or real trading disabled - returning True")
+            return True
+
+        if not self.base_url:
+            print("[test_connection] base_url not configured")
+            return False
+
+        try:
+            url = self.base_url + "/fapi/v1/ping"
+            print(f"[test_connection] GET {url}")
+            r = requests.get(url, timeout=10)
+            print(f"[test_connection] status={r.status_code} text={r.text}")
+            r.raise_for_status()
+            return True
+        except Exception as e:
+            print(f"[test_connection] failed: {e}")
+            return False
