@@ -35,6 +35,74 @@ print(
 # ==========================================================
 import sys
 import time
+# ---------------------------------------------------------------------
+# Small helpers (keep runner resilient to timezone / intel format drift)
+# ---------------------------------------------------------------------
+def get_file_age_seconds(path: str) -> float:
+    """Return file age in seconds (>=0). Returns +inf if file missing."""
+    try:
+        return max(0.0, time.time() - os.path.getmtime(path))
+    except Exception:
+        return float("inf")
+
+def _normalize_entry_instruction(ret):
+    """Normalize EntryAuthority output to (action, confidence, reason)."""
+    if isinstance(ret, tuple) and len(ret) == 3:
+        a, c, r = ret
+        return (str(a).upper(), float(c or 0.0), str(r or ""))
+    if isinstance(ret, dict):
+        a = ret.get("action") or ret.get("bias") or ret.get("intel_action") or "HOLD"
+        c = ret.get("confidence", 0.0)
+        r = ret.get("reason") or ret.get("notes") or "entry_authority"
+        return (str(a).upper(), float(c or 0.0), str(r))
+    a = getattr(ret, "action", None) or getattr(ret, "bias", None) or getattr(ret, "intel_action", None)
+    c = getattr(ret, "confidence", 0.0)
+    r = getattr(ret, "reason", None) or getattr(ret, "notes", None) or "entry_authority"
+    if a is None:
+        return ("HOLD", 0.0, "entry_authority_unrecognized")
+    return (str(a).upper(), float(c or 0.0), str(r))
+
+def _fallback_entry_instruction(symbol: str, intel_signals: dict):
+    """Fallback: use intel_signals[symbol] if present; otherwise HOLD."""
+    if not isinstance(symbol, str):
+        symbol = getattr(symbol, "symbol", str(symbol))
+    sym = symbol.upper()
+    d = intel_signals.get(sym) if isinstance(intel_signals, dict) else None
+    if isinstance(d, dict):
+        a = d.get("action", "HOLD")
+        c = d.get("confidence", 0.0)
+        r = d.get("reason", "intel")
+        return (str(a).upper(), float(c or 0.0), str(r))
+    return ("HOLD", 0.0, "no_intel")
+
+def safe_get_entry_instruction(entry_authority, symbol: str, intel_signals: dict, batch_now):
+    """Call EntryAuthority safely across versions."""
+    if entry_authority is None or not hasattr(entry_authority, "get_entry_instruction"):
+        return _fallback_entry_instruction(symbol, intel_signals)
+
+    fn = getattr(entry_authority, "get_entry_instruction")
+
+    # Preferred signature: (symbol: str, intel_signals: dict, now: datetime)
+    try:
+        return _normalize_entry_instruction(fn(symbol, intel_signals, batch_now))
+    except AttributeError:
+        # Some versions expect an object with `.symbol`
+        class _Sym:
+            pass
+        s = _Sym()
+        s.symbol = symbol
+        try:
+            return _normalize_entry_instruction(fn(s, intel_signals, batch_now))
+        except Exception:
+            return _fallback_entry_instruction(symbol, intel_signals)
+    except TypeError:
+        # Alternate kw signature
+        try:
+            return _normalize_entry_instruction(fn(symbol=symbol, intel=intel_signals, now=batch_now))
+        except Exception:
+            return _fallback_entry_instruction(symbol, intel_signals)
+    except Exception:
+        return _fallback_entry_instruction(symbol, intel_signals)
 import json
 import random
 import atexit
@@ -1725,7 +1793,16 @@ def main():
 
     print("\n📊 Initializing systems...")
     ledger = TradeLedger(base_dir="logs/ledger")
+
+
     print(f"✅ Ledger initialized (run_id: {ledger.run_id})")
+    INTEL_PATH = r"C:\Users\ASUS\Desktop\win-heyue-main3\shared\topn.json"
+    try:
+        age = get_file_age_seconds(INTEL_PATH)
+        syms = load_topn_symbols(INTEL_PATH) or []
+        print(f"[INTEL-CHECK] path={INTEL_PATH} age={age:.1f}s symbols={len(syms)} sample={syms[:5]}")
+    except Exception as e:
+        print(f"[INTEL-CHECK] failed: {e}")
 
     metrics = MetricsCollector(output_dir="logs/metrics")
     print("✅ Metrics collector initialized")
@@ -1859,12 +1936,31 @@ def main():
     print(f"📊 Metrics: {metrics.output_dir}")
     print(f"🚀 Starting trading loop...\n")
 
+    # Periodic reconciliation: helps CLOSE_ONLY recover quickly after manual fixes
+    recon_interval = int(os.environ.get('RECONCILIATION_INTERVAL_SECONDS', os.environ.get('RECON_INTERVAL_SECONDS', '30')))
+    if recon_interval < 5:
+        recon_interval = 5
+    last_recon_check_ts = time.time()
+
     batch_id = 0
 
     try:
         while True:
             batch_id += 1
             batch_now = datetime.now(timezone.utc)
+            # Periodic reconciliation (default every 30s) so CLOSE_ONLY can clear quickly
+            if (time.time() - last_recon_check_ts) >= recon_interval:
+                try:
+                    recon_mode, recon_report = reconciliation.perform_reconciliation()
+                    # Keep logs compact; only show details when inconsistent
+                    if isinstance(recon_report, dict) and not recon_report.get('is_consistent', True):
+                        print(f"[RECONCILIATION] periodic mode={recon_mode} exchange_only={recon_report.get('exchange_only')}")
+                    else:
+                        print(f"[RECONCILIATION] periodic mode={recon_mode}")
+                except Exception as _e:
+                    print(f"[RECONCILIATION] periodic failed: {_e}")
+                last_recon_check_ts = time.time()
+
 
             # ------------------------------
             # Decision layer intake (Intel) + execution universe
@@ -2029,11 +2125,7 @@ def main():
                 print(f"[INTEL] GLOBAL_HOLD=true reason={intel_hold_reason}")
 
             if entry_authority.use_intel and intel_signals:
-                # NOTE: `env_symbols` are strings; some EntryAuthority implementations expect
-                # objects with a `.symbol` attribute and will crash with:
-                #   AttributeError: 'str' object has no attribute 'symbol'
-                # Keep the logic local and purely string-based.
-                intel_universe = sorted(set(env_symbols) | {str(s).upper() for s in intel_signals.keys()})
+                intel_universe = entry_authority.resolve_symbol_universe(env_symbols, intel_signals)
             elif entry_authority.use_intel and entry_authority.intel_symbols_strict:
                 intel_universe = []
             else:
@@ -2155,7 +2247,7 @@ def main():
 
                 if entry_authority.use_intel:
                     if intel_signals and intel_time_ok:
-                        ia, ic, ir = entry_authority.get_entry_instruction(s, intel_signals, batch_now)
+                        ia, ic, ir = safe_get_entry_instruction(entry_authority, s, intel_signals, batch_now)
                     else:
                         ia, ic, ir = "HOLD", 0.0, "intel_stale_or_empty"
                     p["intel_action"] = ia
