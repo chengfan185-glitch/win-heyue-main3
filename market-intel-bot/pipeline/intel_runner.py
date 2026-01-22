@@ -16,9 +16,13 @@ from pipeline.ranker import rank
 from src.settings import load_settings
 from src.store import CooldownState, load_state, save_state, write_json
 from ops.publisher import publish_file, publish_webhook
+import market_intel_ai
 
 
 console = Console()
+
+# Module-level tracker for AI review
+_last_ai_review_ts = 0.0
 
 
 def _now_iso() -> str:
@@ -154,6 +158,49 @@ def main() -> None:
             "topn": filtered,
             "weights": weights,
         }
+
+        # Periodic AI Review
+        try:
+            if cfg.enable_market_intel_ai:
+                now_ts = time.time()
+                review_every = max(60, int(cfg.market_intel_ai_review_seconds))
+                global _last_ai_review_ts
+                if (_last_ai_review_ts == 0.0) or (now_ts - _last_ai_review_ts >= review_every):
+                    ai_snapshot = {
+                        "ts": payload.get("ts"),
+                        "time": payload.get("time"),
+                        "timeframe": payload.get("timeframe"),
+                        "topn": payload.get("topn"),
+                        "universe_size": payload.get("universe_size"),
+                    }
+                    try:
+                        ai_result = market_intel_ai.run_market_intel(ai_snapshot)
+                        payload["ai_intel"] = ai_result
+                        # persist ai result
+                        try:
+                            os.makedirs(os.path.dirname(cfg.market_intel_ai_output_file), exist_ok=True)
+                            write_json(cfg.market_intel_ai_output_file, {"ts": time.time(), "ai": ai_result})
+                        except Exception:
+                            pass
+
+                        # normalize and check for risk_off
+                        ms = None
+                        try:
+                            ms = ai_result.get("market_state") or ai_result.get("state") or ai_result.get("status")
+                            if isinstance(ms, str):
+                                ms = ms.strip().lower()
+                        except Exception:
+                            ms = None
+
+                        if ms in ("risk_off", "risk-off", "risk off"):
+                            payload["global_hold"] = True
+                            payload["intel_global_hold"] = True
+
+                        _last_ai_review_ts = now_ts
+                    except Exception as e:
+                        console.print(f"[{_now_iso()}] [yellow]ai review failed[/yellow]: {e}")
+        except Exception:
+            pass
 
         # Persist
         publish_file(cfg.topn_file, payload)
