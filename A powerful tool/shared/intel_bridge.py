@@ -8,8 +8,10 @@ from typing import Any, Dict
 shared_dir = Path(__file__).resolve().parent
 repo_root = shared_dir.parent.parent
 git_marker = repo_root / ".git"
-if not repo_root.exists() or not git_marker.exists():
+if not repo_root.exists():
     raise RuntimeError(f"[INTEL-BRIDGE] repo root not found: {repo_root}")
+if not git_marker.exists():
+    raise RuntimeError(f"[INTEL-BRIDGE] .git marker not found: {git_marker}")
 
 DST_DEFAULT_TOPN = shared_dir / "topn.json"
 DST_DEFAULT_AI = shared_dir / "ai_intel.json"
@@ -37,8 +39,6 @@ def main() -> None:
     print(f"[INTEL-BRIDGE] SRC={SRC}")
     print(f"[INTEL-BRIDGE] DST_TOPN={DST_TOPN}")
     print(f"[INTEL-BRIDGE] DST_AI={DST_AI}")
-    if not SRC.exists():
-        raise RuntimeError(f"[INTEL-BRIDGE] source topn file not found: {SRC}")
     last_mtime = 0.0
 
     while True:
@@ -55,6 +55,8 @@ def main() -> None:
                     atomic_write_json(DST_AI, data)
 
                     print(f"[INTEL-BRIDGE] synced @ time={data.get('time')} topn={len(data.get('topn', []))} hold={data.get('global_hold')}")
+            else:
+                print(f"[INTEL-BRIDGE] waiting for source file: {SRC}")
         except Exception as e:
             print("[INTEL-BRIDGE] error:", repr(e))
 
