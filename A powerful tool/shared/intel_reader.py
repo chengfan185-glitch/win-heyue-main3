@@ -21,6 +21,7 @@ def load_topn_symbols(path: str) -> Optional[List[str]]:
     Compatible with:
       - {"symbols":[...]}
       - fallback: {"topn":[{"symbol":"BTCUSDT"}, ...]}
+      - extended: {"topn":[{"symbol":"BTCUSDT","direction":"LONG","confidence":0.9}, ...]}
     """
     d = _safe_load_json(path)
     if not d:
