@@ -5,9 +5,12 @@ import time
 from pathlib import Path
 from typing import Any, Dict
 
-SRC = Path(r"C:\Users\ASUS\Desktop\market-intel-bot\store\topn\latest.json")
-DST_TOPN = Path(r"C:\Users\ASUS\Desktop\win-heyue-main3\shared\topn.json")
-DST_AI = Path(r"C:\Users\ASUS\Desktop\win-heyue-main3\shared\ai_intel.json")
+shared_dir = Path(__file__).resolve().parent
+repo_root = shared_dir.parent.parent
+
+SRC = Path(os.getenv("INTEL_BRIDGE_SRC", repo_root / "market-intel-bot" / "store" / "topn" / "latest.json"))
+DST_TOPN = Path(os.getenv("INTEL_BRIDGE_DST_TOPN", str(shared_dir / "topn.json")))
+DST_AI = Path(os.getenv("INTEL_BRIDGE_DST_AI", str(shared_dir / "ai_intel.json")))
 
 POLL_SEC = float(os.getenv("INTEL_BRIDGE_POLL_SEC", "2.0"))
 
@@ -35,10 +38,7 @@ def main() -> None:
                     with open(SRC, "r", encoding="utf-8") as f:
                         data = json.load(f)
 
-                    # 1) shared/topn.json：工具人主入口（保持 market-intel 最新结构）
                     atomic_write_json(DST_TOPN, data)
-
-                    # 2) shared/ai_intel.json：兼容旧接口（同内容镜像）
                     atomic_write_json(DST_AI, data)
 
                     print(f"[INTEL-BRIDGE] synced @ time={data.get('time')} topn={len(data.get('topn', []))} hold={data.get('global_hold')}")
