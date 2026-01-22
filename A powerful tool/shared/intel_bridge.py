@@ -7,10 +7,16 @@ from typing import Any, Dict
 
 shared_dir = Path(__file__).resolve().parent
 repo_root = shared_dir.parent.parent
+if not repo_root.exists():
+    raise RuntimeError(f"[INTEL-BRIDGE] repo root not found: {repo_root}")
 
-SRC = Path(os.getenv("INTEL_BRIDGE_SRC", repo_root / "market-intel-bot" / "store" / "topn" / "latest.json"))
-DST_TOPN = Path(os.getenv("INTEL_BRIDGE_DST_TOPN", str(shared_dir / "topn.json")))
-DST_AI = Path(os.getenv("INTEL_BRIDGE_DST_AI", str(shared_dir / "ai_intel.json")))
+DST_DEFAULT_TOPN = shared_dir / "topn.json"
+DST_DEFAULT_AI = shared_dir / "ai_intel.json"
+SRC_DEFAULT = repo_root / "market-intel-bot" / "store" / "topn" / "latest.json"
+
+SRC = Path(os.getenv("INTEL_BRIDGE_SRC", str(SRC_DEFAULT)))
+DST_TOPN = Path(os.getenv("INTEL_BRIDGE_DST_TOPN", str(DST_DEFAULT_TOPN)))
+DST_AI = Path(os.getenv("INTEL_BRIDGE_DST_AI", str(DST_DEFAULT_AI)))
 
 POLL_SEC = float(os.getenv("INTEL_BRIDGE_POLL_SEC", "2.0"))
 
