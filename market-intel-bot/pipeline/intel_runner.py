@@ -178,7 +178,9 @@ def main() -> None:
                         payload["ai_intel"] = ai_result
                         # persist ai result
                         try:
-                            os.makedirs(os.path.dirname(cfg.market_intel_ai_output_file), exist_ok=True)
+                            output_dir = os.path.dirname(cfg.market_intel_ai_output_file)
+                            if output_dir:
+                                os.makedirs(output_dir, exist_ok=True)
                             write_json(cfg.market_intel_ai_output_file, {"ts": time.time(), "ai": ai_result})
                         except Exception:
                             pass
