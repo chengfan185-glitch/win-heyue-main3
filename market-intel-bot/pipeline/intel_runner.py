@@ -130,6 +130,14 @@ def main() -> None:
                 r["htf_ema_fast"] = rg.get("ema_fast", 0.0)
                 r["htf_ema_slow"] = rg.get("ema_slow", 0.0)
                 r["htf_close"] = rg.get("close", 0.0)
+                allowed = r.get("allowed_actions") or []
+                if "LONG" in allowed and "SHORT" not in allowed:
+                    r["direction"] = "LONG"
+                elif "SHORT" in allowed and "LONG" not in allowed:
+                    r["direction"] = "SHORT"
+                else:
+                    r["direction"] = None
+                r["confidence"] = float(r.get("score") or 0.0)
 
         # Apply cooldown + min score
         filtered = []
@@ -140,6 +148,8 @@ def main() -> None:
             if cfg.trend_only and cfg.enable_regime_gate:
                 # Trend-only mode: publish only symbols with explicit HTF permission (LONG/SHORT)
                 if not (r.get("allowed_actions") or []):
+                    continue
+                if not r.get("direction"):
                     continue
             sym = str(r.get("symbol"))
             if not _should_publish_symbol(state, sym, cfg.cooldown_seconds):
@@ -153,6 +163,14 @@ def main() -> None:
             "universe_size": len(universe),
             "topn": filtered,
             "weights": weights,
+            "meta": {
+                "regime_gate": {
+                    "enabled": bool(cfg.enable_regime_gate),
+                    "trend_only": bool(cfg.trend_only),
+                    "timeframe": cfg.regime_timeframe,
+                },
+                "trend_only": bool(cfg.trend_only),
+            },
         }
 
         # Persist

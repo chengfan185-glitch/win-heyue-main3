@@ -5,9 +5,25 @@ import time
 from pathlib import Path
 from typing import Any, Dict
 
-SRC = Path(r"C:\Users\ASUS\Desktop\market-intel-bot\store\topn\latest.json")
-DST_TOPN = Path(r"C:\Users\ASUS\Desktop\win-heyue-main3\shared\topn.json")
-DST_AI = Path(r"C:\Users\ASUS\Desktop\win-heyue-main3\shared\ai_intel.json")
+shared_dir = Path(__file__).resolve().parent
+repo_root = shared_dir.parent.parent
+git_marker = repo_root / ".git"
+if not repo_root.exists():
+    raise RuntimeError(f"[INTEL-BRIDGE] repo root not found: {repo_root}")
+if not git_marker.exists():
+    raise RuntimeError(f"[INTEL-BRIDGE] .git marker not found: {git_marker}")
+
+DST_DEFAULT_TOPN = shared_dir / "topn.json"
+DST_DEFAULT_AI = shared_dir / "ai_intel.json"
+market_intel_dir = repo_root / "market-intel-bot"
+if not market_intel_dir.exists():
+    raise RuntimeError(f"[INTEL-BRIDGE] market-intel-bot dir not found: {market_intel_dir}")
+
+SRC_DEFAULT = market_intel_dir / "store" / "topn" / "latest.json"
+
+SRC = Path(os.getenv("INTEL_BRIDGE_SRC", str(SRC_DEFAULT)))
+DST_TOPN = Path(os.getenv("INTEL_BRIDGE_DST_TOPN", str(DST_DEFAULT_TOPN)))
+DST_AI = Path(os.getenv("INTEL_BRIDGE_DST_AI", str(DST_DEFAULT_AI)))
 
 POLL_SEC = float(os.getenv("INTEL_BRIDGE_POLL_SEC", "2.0"))
 
@@ -35,13 +51,12 @@ def main() -> None:
                     with open(SRC, "r", encoding="utf-8") as f:
                         data = json.load(f)
 
-                    # 1) shared/topn.json：工具人主入口（保持 market-intel 最新结构）
                     atomic_write_json(DST_TOPN, data)
-
-                    # 2) shared/ai_intel.json：兼容旧接口（同内容镜像）
                     atomic_write_json(DST_AI, data)
 
                     print(f"[INTEL-BRIDGE] synced @ time={data.get('time')} topn={len(data.get('topn', []))} hold={data.get('global_hold')}")
+            else:
+                print(f"[INTEL-BRIDGE] waiting for source file: {SRC}")
         except Exception as e:
             print("[INTEL-BRIDGE] error:", repr(e))
 
