@@ -87,9 +87,10 @@ class Settings:
     openai_daily_budget_usd: float
     openai_cooldown_seconds: int
 
-    enable_market_intel_ai: bool
-    market_intel_ai_review_seconds: int
-    market_intel_ai_output_file: str
+    # AI Market Intel Review Settings
+    enable_market_intel_ai: bool  # Enable periodic AI market review
+    market_intel_ai_review_seconds: int  # Review interval in seconds (default: 1800 = 30min)
+    market_intel_ai_output_file: str  # Path to persist AI review output
 
     dry_run: bool
 

@@ -164,6 +164,7 @@ def main() -> None:
         try:
             if cfg.enable_market_intel_ai:
                 now_ts = time.time()
+                # Enforce minimum 60s interval to prevent excessive API calls
                 review_every = max(60, int(cfg.market_intel_ai_review_seconds))
                 global _last_ai_review_ts
                 if (_last_ai_review_ts == 0.0) or (now_ts - _last_ai_review_ts >= review_every):
@@ -181,8 +182,8 @@ def main() -> None:
                         try:
                             os.makedirs(os.path.dirname(cfg.market_intel_ai_output_file), exist_ok=True)
                             write_json(cfg.market_intel_ai_output_file, {"ts": time.time(), "ai": ai_result})
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            console.print(f"[{_now_iso()}] [yellow]ai output file write failed[/yellow]: {e}")
 
                         # normalize and check for risk_off
                         ms = None
@@ -190,8 +191,8 @@ def main() -> None:
                             ms = ai_result.get("market_state") or ai_result.get("state") or ai_result.get("status")
                             if isinstance(ms, str):
                                 ms = ms.strip().lower()
-                        except Exception:
-                            ms = None
+                        except Exception as e:
+                            console.print(f"[{_now_iso()}] [yellow]ai state extraction failed[/yellow]: {e}")
 
                         if ms in ("risk_off", "risk-off", "risk off"):
                             payload["global_hold"] = True
@@ -200,8 +201,8 @@ def main() -> None:
                         _last_ai_review_ts = now_ts
                     except Exception as e:
                         console.print(f"[{_now_iso()}] [yellow]ai review failed[/yellow]: {e}")
-        except Exception:
-            pass
+        except Exception as e:
+            console.print(f"[{_now_iso()}] [red]ai review logic error[/red]: {e}")
 
         # Persist
         publish_file(cfg.topn_file, payload)
