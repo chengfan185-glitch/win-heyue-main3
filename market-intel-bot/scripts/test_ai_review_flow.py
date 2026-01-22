@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Integration test that simulates the AI review flow
+Integration test that simulates the AI selection flow
 """
 import os
 import sys
@@ -16,57 +16,65 @@ from src.store import write_json
 import pipeline.intel_runner
 
 
-def test_ai_review_integration():
-    """Test that AI review integrates correctly with mock data"""
-    print("Testing AI review integration with mock...")
+def test_ai_selection_integration():
+    """Test that AI selection integrates correctly with mock data"""
+    print("Testing AI selection integration with mock...")
     
-    # Create a mock AI result
-    mock_ai_result_normal = {
-        "market_state": "trend",
-        "strong_sectors": ["BTC", "ETH"],
+    # Create mock AI results
+    mock_ai_result_with_recommendations = {
+        "market_environment": "bullish trend with good volume",
+        "recommended": [
+            {"symbol": "BTCUSDT", "reason": "Strong breakout with volume confirmation", "risk_level": "low"},
+            {"symbol": "ETHUSDT", "reason": "Following BTC momentum", "risk_level": "medium"}
+        ],
+        "excluded_symbols": ["XRPUSDT: too volatile", "DOGEUSDT: weak technicals"],
         "meta": {
             "model": "test",
             "generated_at": "2024-01-01T00:00:00Z"
         }
     }
     
-    mock_ai_result_risk_off = {
-        "market_state": "risk_off",
-        "strong_sectors": [],
+    mock_ai_result_no_recommendations = {
+        "market_environment": "high risk, choppy market",
+        "recommended": [],
+        "excluded_symbols": ["All symbols excluded due to poor market conditions"],
         "meta": {
             "model": "test",
             "generated_at": "2024-01-01T00:00:00Z"
         }
     }
     
-    # Test 1: Normal market state
-    print("\n  Test 1: Normal market state (trend)")
+    # Test 1: With recommendations
+    print("\n  Test 1: AI recommends 2 symbols from Top10")
     payload = {
         "ts": time.time(),
         "time": "2024-01-01T00:00:00",
         "timeframe": "15m",
         "universe_size": 80,
-        "topn": [{"symbol": "BTCUSDT", "score": 0.8}],
+        "topn": [
+            {"symbol": "BTCUSDT", "score": 0.8},
+            {"symbol": "ETHUSDT", "score": 0.7},
+            {"symbol": "XRPUSDT", "score": 0.6},
+        ],
     }
     
-    # Simulate AI review logic
-    ai_result = mock_ai_result_normal
+    # Simulate AI selection logic
+    ai_result = mock_ai_result_with_recommendations
     payload["ai_intel"] = ai_result
     
-    ms = ai_result.get("market_state") or ai_result.get("state") or ai_result.get("status")
-    if isinstance(ms, str):
-        ms = ms.strip().lower()
-    
-    if ms in ("risk_off", "risk-off", "risk off"):
-        payload["global_hold"] = True
-        payload["intel_global_hold"] = True
+    ai_recommended = ai_result.get("recommended", [])
+    if ai_recommended and isinstance(ai_recommended, list):
+        payload["ai_recommended"] = ai_recommended
     
     assert "ai_intel" in payload
-    assert "global_hold" not in payload, "global_hold should not be set for normal state"
-    print("    ✓ Payload correctly does not have global_hold for normal state")
+    assert "ai_recommended" in payload
+    assert len(payload["ai_recommended"]) == 2
+    assert payload["ai_recommended"][0]["symbol"] == "BTCUSDT"
+    assert "global_hold" not in payload, "global_hold should NOT be set (removed feature)"
+    print("    ✓ Payload has ai_recommended with 2 symbols")
     
-    # Test 2: Risk off state
-    print("\n  Test 2: Risk off market state")
+    # Test 2: No recommendations (risky market)
+    print("\n  Test 2: AI recommends 0 symbols (risky conditions)")
     payload2 = {
         "ts": time.time(),
         "time": "2024-01-01T00:00:00",
@@ -75,26 +83,21 @@ def test_ai_review_integration():
         "topn": [{"symbol": "BTCUSDT", "score": 0.8}],
     }
     
-    ai_result2 = mock_ai_result_risk_off
+    ai_result2 = mock_ai_result_no_recommendations
     payload2["ai_intel"] = ai_result2
     
-    ms2 = ai_result2.get("market_state") or ai_result2.get("state") or ai_result2.get("status")
-    if isinstance(ms2, str):
-        ms2 = ms2.strip().lower()
-    
-    if ms2 in ("risk_off", "risk-off", "risk off"):
-        payload2["global_hold"] = True
-        payload2["intel_global_hold"] = True
+    ai_recommended2 = ai_result2.get("recommended", [])
+    if ai_recommended2 and isinstance(ai_recommended2, list):
+        payload2["ai_recommended"] = ai_recommended2
     
     assert "ai_intel" in payload2
-    assert "global_hold" in payload2 and payload2["global_hold"] == True
-    assert "intel_global_hold" in payload2 and payload2["intel_global_hold"] == True
-    print("    ✓ Payload correctly has global_hold=True and intel_global_hold=True")
+    assert "ai_recommended" not in payload2, "ai_recommended should not be added if empty"
+    print("    ✓ Payload correctly has no ai_recommended when AI returns empty list")
     
     # Test 3: File persistence
     print("\n  Test 3: AI result file persistence")
     test_output_file = "/tmp/test_ai_output.json"
-    test_data = {"ts": time.time(), "ai": mock_ai_result_normal}
+    test_data = {"ts": time.time(), "ai": mock_ai_result_with_recommendations}
     
     try:
         os.makedirs(os.path.dirname(test_output_file), exist_ok=True)
@@ -109,7 +112,8 @@ def test_ai_review_integration():
             loaded_data = orjson.loads(f.read())
             assert "ts" in loaded_data
             assert "ai" in loaded_data
-            assert loaded_data["ai"]["market_state"] == "trend"
+            assert loaded_data["ai"]["market_environment"] == "bullish trend with good volume"
+            assert len(loaded_data["ai"]["recommended"]) == 2
         
         print("    ✓ AI result successfully persisted to file")
         
@@ -119,7 +123,7 @@ def test_ai_review_integration():
         print(f"    ✗ File persistence failed: {e}")
         return False
     
-    print("\n✓ AI review integration test passed")
+    print("\n✓ AI selection integration test passed")
     return True
 
 
@@ -158,7 +162,7 @@ def test_review_interval_logic():
 if __name__ == "__main__":
     try:
         success = True
-        success = test_ai_review_integration() and success
+        success = test_ai_selection_integration() and success
         success = test_review_interval_logic() and success
         
         if success:

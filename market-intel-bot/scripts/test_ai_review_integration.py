@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Test script to validate the AI review integration
+Test script to validate the AI selection integration
 """
 import os
 import sys
@@ -35,42 +35,56 @@ def test_settings():
     return True
 
 
-def test_ai_review_logic():
-    """Test the AI review logic for risk_off detection"""
-    print("\nTesting AI review logic...")
+def test_ai_selection_logic():
+    """Test the AI selection logic for extracting recommended symbols"""
+    print("\nTesting AI selection logic...")
     
-    # Test various market_state values
+    # Test cases for recommended field extraction
     test_cases = [
-        ({"market_state": "risk_off"}, True),
-        ({"market_state": "risk-off"}, True),
-        ({"market_state": "risk off"}, True),
-        ({"market_state": "RISK_OFF"}, True),
-        ({"state": "risk_off"}, True),
-        ({"status": "risk-off"}, True),
-        ({"market_state": "trend"}, False),
-        ({"market_state": "range"}, False),
-        ({}, False),
+        (
+            {
+                "market_environment": "bullish trend",
+                "recommended": [
+                    {"symbol": "BTCUSDT", "reason": "Strong momentum", "risk_level": "low"},
+                    {"symbol": "ETHUSDT", "reason": "Good volume", "risk_level": "medium"}
+                ]
+            },
+            2,
+            True
+        ),
+        (
+            {
+                "market_environment": "ranging",
+                "recommended": []
+            },
+            0,
+            False
+        ),
+        (
+            {
+                "market_environment": "volatile",
+            },
+            0,
+            False
+        ),
     ]
     
-    for ai_result, should_hold in test_cases:
-        # Simulate the normalization logic from intel_runner.py
-        ms = None
-        try:
-            ms = ai_result.get("market_state") or ai_result.get("state") or ai_result.get("status")
-            if isinstance(ms, str):
-                ms = ms.strip().lower()
-        except Exception:
-            ms = None
+    for ai_result, expected_count, should_have_field in test_cases:
+        # Simulate the extraction logic from intel_runner.py
+        ai_recommended = ai_result.get("recommended", [])
+        has_recommended = bool(ai_recommended and isinstance(ai_recommended, list))
         
-        is_risk_off = ms in ("risk_off", "risk-off", "risk off")
-        
-        if is_risk_off != should_hold:
-            print(f"✗ Failed for {ai_result}: expected hold={should_hold}, got hold={is_risk_off}")
+        if has_recommended != should_have_field:
+            print(f"✗ Failed for {ai_result}: expected has_recommended={should_have_field}, got {has_recommended}")
             return False
-        else:
-            print(f"  ✓ {ai_result} -> hold={is_risk_off} (correct)")
+        
+        if has_recommended and len(ai_recommended) != expected_count:
+            print(f"✗ Failed for {ai_result}: expected {expected_count} recommendations, got {len(ai_recommended)}")
+            return False
+            
+        print(f"  ✓ {ai_result.get('market_environment')} -> {len(ai_recommended)} recommendations (correct)")
     
-    print("✓ AI review logic test passed")
+    print("✓ AI selection logic test passed")
     return True
 
 
@@ -84,19 +98,35 @@ def test_payload_structure():
         "time": "2024-01-01T00:00:00",
         "timeframe": "15m",
         "universe_size": 80,
-        "topn": [],
+        "topn": [
+            {"symbol": "BTCUSDT", "score": 0.8},
+            {"symbol": "ETHUSDT", "score": 0.7}
+        ],
         "weights": {},
     }
     
     # Test adding AI intel
-    payload["ai_intel"] = {"market_state": "risk_off"}
+    ai_result = {
+        "market_environment": "bullish",
+        "recommended": [
+            {"symbol": "BTCUSDT", "reason": "Strong momentum", "risk_level": "low"}
+        ]
+    }
+    payload["ai_intel"] = ai_result
     assert "ai_intel" in payload, "Failed to add ai_intel to payload"
     
-    # Test adding global_hold flags
-    payload["global_hold"] = True
-    payload["intel_global_hold"] = True
-    assert payload["global_hold"] == True, "Failed to set global_hold"
-    assert payload["intel_global_hold"] == True, "Failed to set intel_global_hold"
+    # Test adding ai_recommended
+    ai_recommended = ai_result.get("recommended", [])
+    if ai_recommended and isinstance(ai_recommended, list):
+        payload["ai_recommended"] = ai_recommended
+    
+    assert "ai_recommended" in payload, "Failed to add ai_recommended to payload"
+    assert len(payload["ai_recommended"]) == 1, "ai_recommended should have 1 item"
+    assert payload["ai_recommended"][0]["symbol"] == "BTCUSDT", "Symbol should match"
+    
+    # Verify no global_hold fields are added
+    assert "global_hold" not in payload, "global_hold should not be in payload"
+    assert "intel_global_hold" not in payload, "intel_global_hold should not be in payload"
     
     print("✓ Payload structure test passed")
     return True
@@ -106,7 +136,7 @@ if __name__ == "__main__":
     try:
         success = True
         success = test_settings() and success
-        success = test_ai_review_logic() and success
+        success = test_ai_selection_logic() and success
         success = test_payload_structure() and success
         
         if success:

@@ -1,30 +1,33 @@
-# AI Review Integration - Market Intel Bot
+# AI Selection Integration - Market Intel Bot
 
 ## Overview
 
-The market-intel-bot now includes periodic AI review functionality that analyzes market conditions and can trigger a global hold when risk is detected.
+The market-intel-bot now includes periodic AI selection functionality that picks 2-5 optimal targets from the Top10 candidates for execution.
 
 ## Features
 
-### Periodic AI Review
+### Periodic AI Selection
 - Runs every 30 minutes by default (configurable)
-- Analyzes market snapshot with top candidates
-- Publishes AI results alongside market intelligence data
-- Automatically sets global hold flags when risk detected
+- Analyzes market environment and risk assessment
+- Selects 2-5 best targets from Top10 candidates
+- Publishes AI selections alongside market intelligence data
+- Executor/tool-bot trades ONLY the AI-recommended symbols
 
-### Global Hold Mechanism
-When the AI reviewer detects a `risk_off` market state, the system automatically sets:
-- `global_hold: true` - Main hold flag
-- `intel_global_hold: true` - Legacy compatibility flag
+### AI-Powered Filtering
+The AI evaluates:
+- Current market environment (trend, volatility, risk)
+- Each candidate's technical strength
+- Risk level for each symbol
+- Overall market conditions
 
-This triggers the executor/tool-bot to stop trading automatically.
+Result: 2-5 carefully selected symbols with reasoning
 
 ## Configuration
 
 Configure via environment variables:
 
 ```bash
-# Enable/disable AI review (default: true)
+# Enable/disable AI selection (default: true)
 ENABLE_MARKET_INTEL_AI=true
 
 # Review interval in seconds (default: 1800 = 30 minutes)
@@ -36,45 +39,74 @@ MARKET_INTEL_AI_OUTPUT_FILE=store/ai_intel/latest.json
 
 ## Output Format
 
-### TopN Payload with AI Intel
+### TopN Payload with AI Selection
 ```json
 {
   "ts": 1234567890.123,
   "time": "2024-01-01T12:00:00",
   "timeframe": "15m",
   "universe_size": 80,
-  "topn": [...],
+  "topn": [
+    {"symbol": "BTCUSDT", "score": 0.85, ...},
+    {"symbol": "ETHUSDT", "score": 0.82, ...},
+    {"symbol": "BNBUSDT", "score": 0.78, ...},
+    ...10 candidates total
+  ],
   "weights": {...},
   "ai_intel": {
-    "market_state": "trend",
-    "strong_sectors": ["BTC", "ETH"],
-    "meta": {
-      "model": "openai",
-      "generated_at": "2024-01-01T12:00:00Z"
-    }
-  }
-}
-```
-
-### With Global Hold (Risk Off)
-```json
-{
-  "ts": 1234567890.123,
-  "time": "2024-01-01T12:00:00",
-  "timeframe": "15m",
-  "universe_size": 80,
-  "topn": [...],
-  "weights": {...},
-  "ai_intel": {
-    "market_state": "risk_off",
-    "strong_sectors": [],
+    "market_environment": "Bullish trend with good volume",
+    "recommended": [
+      {
+        "symbol": "BTCUSDT",
+        "reason": "Strong breakout with volume confirmation",
+        "risk_level": "low"
+      },
+      {
+        "symbol": "ETHUSDT",
+        "reason": "Following BTC momentum, good technical setup",
+        "risk_level": "medium"
+      }
+    ],
+    "excluded_symbols": [
+      "BNBUSDT: Weak volume",
+      "XRPUSDT: Too volatile for current conditions"
+    ],
     "meta": {
       "model": "openai",
       "generated_at": "2024-01-01T12:00:00Z"
     }
   },
-  "global_hold": true,
-  "intel_global_hold": true
+  "ai_recommended": [
+    {
+      "symbol": "BTCUSDT",
+      "reason": "Strong breakout with volume confirmation",
+      "risk_level": "low"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "reason": "Following BTC momentum, good technical setup",
+      "risk_level": "medium"
+    }
+  ]
+}
+```
+
+### When No Recommendations (High Risk)
+```json
+{
+  "ts": 1234567890.123,
+  "time": "2024-01-01T12:00:00",
+  "timeframe": "15m",
+  "topn": [...],
+  "ai_intel": {
+    "market_environment": "High volatility, choppy conditions",
+    "recommended": [],
+    "excluded_symbols": [
+      "All symbols excluded due to poor market conditions"
+    ],
+    "meta": {...}
+  }
+  // Note: No "ai_recommended" field when empty
 }
 ```
 
@@ -86,30 +118,43 @@ The AI results are also persisted separately to the configured output file:
 {
   "ts": 1234567890.123,
   "ai": {
-    "market_state": "risk_off",
-    "strong_sectors": [],
-    "meta": {
-      "model": "openai",
-      "generated_at": "2024-01-01T12:00:00Z"
-    }
+    "market_environment": "Bullish trend with good volume",
+    "recommended": [
+      {
+        "symbol": "BTCUSDT",
+        "reason": "Strong breakout with volume confirmation",
+        "risk_level": "low"
+      }
+    ],
+    "excluded_symbols": [...],
+    "meta": {...}
   }
 }
 ```
 
-## Risk Detection
+## Executor Behavior
 
-The system checks for risk_off in multiple field names for robustness:
-- `market_state`
-- `state`
-- `status`
+The executor/tool-bot should:
+1. Read the published TopN payload
+2. Check for `ai_recommended` field
+3. **Trade ONLY the symbols in `ai_recommended`** (ignore other Top10)
+4. If `ai_recommended` is absent or empty, skip trading for this cycle
 
-Any of these containing `"risk_off"`, `"risk-off"`, or `"risk off"` (case-insensitive) will trigger the global hold.
+## Selection Criteria
+
+The AI considers:
+- **Market Environment**: Overall trend, volatility, liquidity
+- **Technical Strength**: Momentum, breakout quality, volume
+- **Risk Assessment**: Volatility level, market structure
+- **Diversification**: Avoid correlated assets if possible
+- **Quantity**: Always 2-5 symbols (never more, sometimes less)
 
 ## Error Handling
 
-- AI review failures are logged but don't prevent normal publishing
+- AI selection failures are logged but don't prevent normal publishing
 - All AI operations wrapped in try/except for robustness
-- If AI call fails, the bot continues with normal TopN publishing
+- If AI call fails, payload published without `ai_recommended` field
+- TopN candidates always published regardless of AI status
 
 ## Testing
 
@@ -124,14 +169,14 @@ python3 scripts/test_ai_review_flow.py
 ## Architecture
 
 The implementation uses:
-- Existing `market_intel_ai.run_market_intel()` function
+- Existing `market_intel_ai.run_market_intel()` function with updated prompt
 - Module-level timestamp tracker for review intervals
 - Minimal changes to preserve existing behavior
-- Dual compatibility flags (global_hold + intel_global_hold)
+- New `ai_recommended` field for executor consumption
 
 ## Compatibility
 
 - No breaking changes to existing behavior
-- Works with existing executor/tool-bot implementations
+- TopN candidates unchanged - full list still available
 - Backward compatible with systems that don't check AI fields
-- Both hold flags ensure maximum compatibility with different executor versions
+- Executor can choose to ignore AI recommendations if needed

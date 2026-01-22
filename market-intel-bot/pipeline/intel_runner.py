@@ -159,7 +159,7 @@ def main() -> None:
             "weights": weights,
         }
 
-        # Periodic AI Review
+        # Periodic AI Selection (pick 2-5 from Top10)
         try:
             if cfg.enable_market_intel_ai:
                 now_ts = time.time()
@@ -176,6 +176,12 @@ def main() -> None:
                     try:
                         ai_result = market_intel_ai.run_market_intel(ai_snapshot)
                         payload["ai_intel"] = ai_result
+                        
+                        # Extract AI recommended symbols (2-5 from Top10)
+                        ai_recommended = ai_result.get("recommended", [])
+                        if ai_recommended and isinstance(ai_recommended, list):
+                            payload["ai_recommended"] = ai_recommended
+                        
                         # persist ai result
                         try:
                             output_dir = os.path.dirname(cfg.market_intel_ai_output_file)
@@ -185,22 +191,9 @@ def main() -> None:
                         except Exception:
                             pass
 
-                        # normalize and check for risk_off
-                        ms = None
-                        try:
-                            ms = ai_result.get("market_state") or ai_result.get("state") or ai_result.get("status")
-                            if isinstance(ms, str):
-                                ms = ms.strip().lower()
-                        except Exception:
-                            ms = None
-
-                        if ms in ("risk_off", "risk-off", "risk off"):
-                            payload["global_hold"] = True
-                            payload["intel_global_hold"] = True
-
                         _last_ai_review_ts = now_ts
                     except Exception as e:
-                        console.print(f"[{_now_iso()}] [yellow]ai review failed[/yellow]: {e}")
+                        console.print(f"[{_now_iso()}] [yellow]ai selection failed[/yellow]: {e}")
         except Exception:
             pass
 
