@@ -16,9 +16,13 @@ from pipeline.ranker import rank
 from src.settings import load_settings
 from src.store import CooldownState, load_state, save_state, write_json
 from ops.publisher import publish_file, publish_webhook
+import market_intel_ai
 
 
 console = Console()
+
+# Module-level tracker for AI review
+_last_ai_review_ts = 0.0
 
 
 def _now_iso() -> str:
@@ -154,6 +158,44 @@ def main() -> None:
             "topn": filtered,
             "weights": weights,
         }
+
+        # Periodic AI Selection (pick 2-5 from Top10)
+        try:
+            if cfg.enable_market_intel_ai:
+                now_ts = time.time()
+                review_every = max(60, int(cfg.market_intel_ai_review_seconds))
+                global _last_ai_review_ts
+                if (_last_ai_review_ts == 0.0) or (now_ts - _last_ai_review_ts >= review_every):
+                    ai_snapshot = {
+                        "ts": payload.get("ts"),
+                        "time": payload.get("time"),
+                        "timeframe": payload.get("timeframe"),
+                        "topn": payload.get("topn"),
+                        "universe_size": payload.get("universe_size"),
+                    }
+                    try:
+                        ai_result = market_intel_ai.run_market_intel(ai_snapshot)
+                        payload["ai_intel"] = ai_result
+                        
+                        # Extract AI recommended symbols (2-5 from Top10)
+                        ai_recommended = ai_result.get("recommended", [])
+                        if ai_recommended and isinstance(ai_recommended, list):
+                            payload["ai_recommended"] = ai_recommended
+                        
+                        # persist ai result
+                        try:
+                            output_dir = os.path.dirname(cfg.market_intel_ai_output_file)
+                            if output_dir:
+                                os.makedirs(output_dir, exist_ok=True)
+                            write_json(cfg.market_intel_ai_output_file, {"ts": time.time(), "ai": ai_result})
+                        except Exception:
+                            pass
+
+                        _last_ai_review_ts = now_ts
+                    except Exception as e:
+                        console.print(f"[{_now_iso()}] [yellow]ai selection failed[/yellow]: {e}")
+        except Exception:
+            pass
 
         # Persist
         publish_file(cfg.topn_file, payload)
