@@ -87,6 +87,11 @@ class Settings:
     openai_daily_budget_usd: float
     openai_cooldown_seconds: int
 
+    # AI Market Intel Review Settings
+    enable_market_intel_ai: bool  # Enable periodic AI market review
+    market_intel_ai_review_seconds: int  # Review interval in seconds (default: 1800 = 30min)
+    market_intel_ai_output_file: str  # Path to persist AI review output
+
     dry_run: bool
 
 
@@ -141,6 +146,10 @@ def load_settings() -> Settings:
         openai_max_tokens=_getint("OPENAI_MAX_TOKENS", "400"),
         openai_daily_budget_usd=_getfloat("OPENAI_DAILY_BUDGET_USD", "2.0"),
         openai_cooldown_seconds=_getint("OPENAI_COOLDOWN_SECONDS", "600"),
+
+        enable_market_intel_ai=_getbool("ENABLE_MARKET_INTEL_AI", "true"),
+        market_intel_ai_review_seconds=_getint("MARKET_INTEL_AI_REVIEW_SECONDS", "1800"),
+        market_intel_ai_output_file=_getenv("MARKET_INTEL_AI_OUTPUT_FILE", "store/ai_intel/latest.json"),
 
         dry_run=_getbool("DRY_RUN", "true"),
     )
