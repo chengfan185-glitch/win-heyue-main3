@@ -16,9 +16,14 @@ from pipeline.ranker import rank
 from src.settings import load_settings
 from src.store import CooldownState, load_state, save_state, write_json
 from ops.publisher import publish_file, publish_webhook
+# Market intel AI module for periodic review
+import market_intel_ai
 
 
 console = Console()
+
+# Module-level last AI review timestamp
+_last_ai_review_ts = 0.0
 
 
 def _now_iso() -> str:
@@ -154,6 +159,49 @@ def main() -> None:
             "topn": filtered,
             "weights": weights,
         }
+
+        # Periodic AI review
+        global _last_ai_review_ts
+        if cfg.enable_market_intel_ai:
+            now_ts = time.time()
+            elapsed = now_ts - _last_ai_review_ts
+            if elapsed >= cfg.market_intel_ai_review_seconds:
+                try:
+                    # Build AI snapshot
+                    ai_snapshot = {
+                        "ts": payload["ts"],
+                        "time": payload["time"],
+                        "timeframe": payload["timeframe"],
+                        "topn": payload["topn"],
+                        "universe_size": payload["universe_size"],
+                    }
+                    
+                    # Call AI
+                    ai_result = market_intel_ai.run_market_intel(ai_snapshot)
+                    
+                    # Attach to payload
+                    payload["ai_intel"] = ai_result
+                    
+                    # Persist AI result (write_json handles directory creation)
+                    try:
+                        write_json(cfg.market_intel_ai_output_file, ai_result)
+                    except Exception as e:
+                        console.print(f"[{_now_iso()}] [yellow]AI output write failed[/yellow]: {e}")
+                    
+                    # Check for risk_off state
+                    market_state = ai_result.get("market_state") or ai_result.get("state") or ai_result.get("status")
+                    if isinstance(market_state, str):
+                        normalized_state = market_state.lower().replace("_", "").replace("-", "").replace(" ", "")
+                        if normalized_state == "riskoff":
+                            payload["global_hold"] = True
+                            payload["intel_global_hold"] = True
+                            console.print(f"[{_now_iso()}] [red]AI detected risk_off - setting global_hold flags[/red]")
+                    
+                    _last_ai_review_ts = now_ts
+                    console.print(f"[{_now_iso()}] [green]AI review completed[/green]")
+                    
+                except Exception as e:
+                    console.print(f"[{_now_iso()}] [yellow]AI review failed[/yellow]: {e}")
 
         # Persist
         publish_file(cfg.topn_file, payload)
